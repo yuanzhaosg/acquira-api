@@ -1,6 +1,8 @@
 import os, json, re, base64, tempfile, shutil
+from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -9,6 +11,8 @@ import pdfplumber
 import fitz  # pymupdf
 import openpyxl
 import zipfile
+import docx as python_docx   # python-docx
+import xlrd                   # legacy .xls support
 from supabase import create_client
 
 app = FastAPI()
@@ -21,7 +25,7 @@ app.add_middleware(
 )
 
 MODEL      = "claude-sonnet-4-20250514"
-MAX_TOKENS = 8000
+MAX_TOKENS = 12000
 
 client   = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
@@ -53,6 +57,15 @@ VIC-SPECIFIC CONTEXT:
 - VKF (Vic Kinder Funding) = State Government kindergarten subsidy, counted as revenue.
 - NQS ratings: Excellent > Exceeding NQS > Meeting NQS > Working Towards NQS > Significant Improvement Required.
 - Owner-operator director wages are a standard addback item.
+- ADDBACK RULES: Normalised EBITDA = reported EBITDA + verified addbacks.
+  Standard addbacks to extract and itemise:
+  (1) Owner/director salary above market replacement cost (~$80-110K for a centre manager)
+  (2) One-off non-recurring expenses clearly stated in the IM
+  (3) Personal expenses run through the business (must be stated in IM)
+  Do NOT invent addbacks. Only include what is explicitly stated in the documents.
+- Always extract BOTH: reported_ebitda (as stated) AND normalised_ebitda (after addbacks).
+- If addbacks are claimed but unverified, flag them in anomalies with reason.
+- Labour ratio and rent ratio should be calculated on REPORTED revenue, not normalised.
 
 Return this exact JSON structure (set fields to null if not found):
 
@@ -87,7 +100,16 @@ Return this exact JSON structure (set fields to null if not found):
     "fy25": {"revenue": null, "total_labour_cost": null, "rent_pa": null, "ebitda": null, "labour_ratio_pct": null, "rent_ratio_pct": null, "ebitda_margin_pct": null},
     "ebitda_3yr_average": null, "revenue_trend": null, "labour_trend": null,
     "asking_price": null, "asking_price_ebitda_multiple": null,
-    "vendor_excess_wages_claim": null, "addbacks_total": null, "normalised_ebitda": null
+    "addbacks": {
+      "owner_salary_addback": null,
+      "owner_salary_note": null,
+      "other_addbacks": [],
+      "addbacks_total": null,
+      "reported_ebitda": null,
+      "normalised_ebitda": null,
+      "normalised_ebitda_multiple": null,
+      "addback_confidence": "none"
+    }
   },
   "lease": {
     "commencement_date": null, "expiry_date": null, "status": "UNKNOWN",
@@ -107,7 +129,6 @@ Return this exact JSON structure (set fields to null if not found):
   }
 }"""
 
-# v2 scoring prompt — aligned with scoring-v2.ts and route.ts schema
 SCORING_SYSTEM_PROMPT = """You are an expert childcare acquisition analyst for Acquira. You receive structured data extracted from a childcare centre Information Memorandum (IM) and score it across 17 dimensions.
 
 ABSOLUTE OUTPUT RULES:
@@ -117,11 +138,14 @@ ABSOLUTE OUTPUT RULES:
 4. temperature is 0 — your output must be fully deterministic given the same input.
 
 SCORING PHILOSOPHY:
-- Start each dimension at 5.0 (neutral). Apply point adjustments based on signals.
-- Every adjustment MUST quote the actual number from the data.
+- Score each dimension on a 0-10 scale using the rubric below.
+- 5.0 = industry average / neutral. 7.0+ = genuinely good. 9.0+ = exceptional.
+- Every score MUST quote the actual number from the data in its summary.
 - Dimension summaries must be 2-3 sentences specific to THIS deal.
+- The server will recalculate total_score using weights — set it to 0 in your output.
+- If data is missing for a dimension, score it 5.0 (neutral) and note it in summary.
 
-DIMENSION WEIGHTS (server enforces these):
+DIMENSION WEIGHTS (for reference — server recalculates):
 occupancy_demand:        0.15
 profitability_cashflow:  0.15
 revenue_pricing:         0.08
@@ -140,14 +164,120 @@ fee_benchmarking:        0.02
 operator_quality:        0.02
 enrolment_trend:         0.01
 
-POINT TABLE:
-occupancy_demand: +2.0 occ>=75%, +1.0 65-74%, 0.0 55-64%, -1.5 45-54%, -3.0 <45%
-staffing_resilience: +2.0 labour<55%, +1.0 55-60%, 0.0 60-65%, -1.0 65-70%, -2.0 70-75%, -3.0 >75%
-profitability_cashflow: +2.0 margin>=20%, +1.0 15-19%, 0.0 10-14%, -1.0 5-9%, -2.0 <5%, -3.0 negative
-lease_economics: +0.5 rent<15% rev, 0.0 15-20%, -0.5 20-25%, -1.5 >25%
-lease_tail: +2.0 tenure>=15yr, +1.0 10-14yr, 0.0 5-9yr, -2.0 2-4yr, -3.0 <2yr or expired
-regulatory_quality: +1.5 Exceeding NQS, +1.0 Meeting NQS, -0.5 Working Towards, -2.0 SIR
-valuation_structure: +2.0 <2x EBITDA, +1.0 2-3x, 0.0 3-4x, -1.0 4-5x, -2.0 >5x, -1.0 POA
+SCORING RUBRIC (0-10 per dimension):
+
+occupancy_demand:
+  9-10: occ >= 90%, strong waitlist
+  7-8:  occ 75-89%, some waitlist
+  5-6:  occ 60-74%, stable
+  3-4:  occ 45-59%, declining or flat
+  1-2:  occ < 45%, critical
+
+profitability_cashflow:
+  9-10: EBITDA margin >= 25%
+  7-8:  margin 18-24%
+  5-6:  margin 10-17%
+  3-4:  margin 3-9%
+  1-2:  margin < 3% or negative
+
+staffing_resilience:
+  9-10: labour ratio < 52%
+  7-8:  labour 52-58%
+  5-6:  labour 58-65%
+  3-4:  labour 65-72%
+  1-2:  labour > 72%
+
+lease_economics:
+  9-10: rent < 10% of revenue
+  7-8:  rent 10-15%
+  5-6:  rent 15-20%
+  3-4:  rent 20-25%
+  1-2:  rent > 25%
+
+lease_tail:
+  9-10: >= 15 years remaining tenure (incl options)
+  7-8:  10-14 years
+  5-6:  5-9 years
+  3-4:  2-4 years
+  1-2:  < 2 years or expired
+
+regulatory_quality:
+  9-10: Exceeding NQS, recent assessment
+  7-8:  Meeting NQS
+  5-6:  Meeting NQS, assessment overdue
+  3-4:  Working Towards NQS
+  1-2:  SIR or active compliance notices
+
+valuation_structure:
+  9-10: <= 2x EBITDA
+  7-8:  2-3x EBITDA
+  5-6:  3-4x EBITDA
+  3-4:  4-5x EBITDA
+  1-2:  > 5x EBITDA or POA
+
+market_position:
+  9-10: < 1.5 competitors per licensed place within 3km, strong demographics
+  7-8:  balanced supply zone
+  5-6:  average competition
+  3-4:  oversupplied market
+  1-2:  heavily oversupplied
+
+management_systems:
+  7-8:  professional management team, strong systems, not owner-dependent
+  5-6:  semi-professional, some key-person risk
+  3-4:  owner-operator, high transition risk
+  1-2:  sole operator, no documented systems
+
+revenue_pricing:
+  7-8:  fees above suburb median, strong CCS mix, multiple revenue streams
+  5-6:  fees at market, standard CCS dependency
+  3-4:  fees below market, limited pricing power
+  1-2:  fees significantly below market, no uplift path
+
+upside_levers:
+  7-8:  clear fee uplift headroom, occupancy expansion possible, kinder funding upside
+  5-6:  some upside, limited by market or occupancy ceiling
+  3-4:  limited upside, near capacity or market ceiling
+  1-2:  no meaningful upside identified
+
+ccs_risk:
+  7-8:  low CCS cliff exposure, diverse family demographics
+  5-6:  moderate CCS dependency
+  3-4:  high CCS dependency, activity test risk
+  1-2:  critical CCS exposure
+
+capex_liability:
+  9-10: new fit-out, no CAPEX required
+  7-8:  < 3 years old, minimal CAPEX
+  5-6:  3-7 years, routine maintenance only
+  3-4:  7-12 years, significant refresh likely
+  1-2:  > 12 years or major CAPEX flagged
+
+staff_qualification_mix:
+  7-8:  > 35% degree qualified, low wage trajectory risk
+  5-6:  20-35% degree qualified
+  3-4:  < 20% degree qualified, high wage risk
+  1-2:  unknown or significant compliance risk
+
+fee_benchmarking:
+  7-8:  fees >= suburb median, room to increase
+  5-6:  fees within 5% of median
+  3-4:  fees > 5% below median
+  1-2:  fees significantly below market
+
+operator_quality:
+  9-10: Exceeding NQS, no conditions/notices, strong compliance history
+  7-8:  Meeting NQS, clean record
+  5-6:  Meeting NQS, minor issues resolved
+  3-4:  Working Towards NQS or unresolved conditions
+  1-2:  SIR, active notices, enforcement history
+
+enrolment_trend:
+  9-10: occupancy improving, strong waitlist across age groups
+  7-8:  stable at high occupancy, moderate waitlist
+  5-6:  stable, no waitlist
+  3-4:  declining occupancy trend
+  1-2:  significant decline
 
 DEAL-BREAKER FLAGS to evaluate (set triggered true/false):
 occupancy_critical (occ<50%), occupancy_warning (50-65%), rent_ratio_danger (rent>15% rev),
@@ -198,14 +328,21 @@ Return this exact JSON schema (null for unknowns, never omit keys):
 
 def classify_file(filename: str) -> str:
     f = filename.lower()
-    if any(x in f for x in ['p&l', 'p_l', 'profit', 'loss']): return 'pl_excel'
-    if any(x in f for x in ['occupancy', 'utilisation', 'utilization']): return 'occupancy_excel'
-    if 'transaction' in f: return 'transaction_excel'
-    if 'payroll' in f: return 'payroll_excel'
-    if any(x in f for x in ['lease', 'deed of variation', 'tenancy']): return 'lease_pdf'
-    if 'service approval' in f: return 'service_approval_pdf'
-    if any(x in f for x in ['nqs', 'acecqa', 'rating']): return 'nqs_pdf'
-    if f.endswith('.pdf'): return 'im_pdf'
+    # Check extension first to avoid e.g. 'lease terms.docx' -> lease_pdf
+    if f.endswith(('.xlsx', '.xls', '.csv')):
+        if any(x in f for x in ['p&l', 'p_l', 'profit', 'loss']): return 'pl_excel'
+        if any(x in f for x in ['occupancy', 'utilisation', 'utilization']): return 'occupancy_excel'
+        if 'transaction' in f: return 'transaction_excel'
+        if 'payroll' in f: return 'payroll_excel'
+        return 'pl_excel'
+    if f.endswith('.pdf'):
+        if any(x in f for x in ['lease', 'deed', 'tenancy']): return 'lease_pdf'
+        if 'service approval' in f: return 'service_approval_pdf'
+        if any(x in f for x in ['nqs', 'acecqa', 'rating']): return 'nqs_pdf'
+        return 'im_pdf'
+    if f.endswith('.docx'):
+        if any(x in f for x in ['lease', 'deed', 'tenancy']): return 'lease_docx'
+        return 'im_docx'
     return 'unknown'
 
 def extract_pdf_text(pdf_path: str) -> str:
@@ -260,18 +397,73 @@ async def extract_scanned_pdf_text(pdf_path: str, purpose: str) -> str:
         return ''
 
 def extract_excel_text(xlsx_path: str) -> str:
+    """Extract text from .xlsx or legacy .xls files."""
+    path_lower = xlsx_path.lower()
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-        out = []
-        for sheet in wb.sheetnames:
-            ws = wb[sheet]
-            out.append(f'Sheet: {sheet}')
-            for row in ws.iter_rows(values_only=True):
-                if any(v is not None for v in row):
-                    out.append(','.join(str(v) if v is not None else '' for v in row))
-        return '\n'.join(out[:500])
-    except Exception:
+        if path_lower.endswith('.xls') and not path_lower.endswith('.xlsx'):
+            # Legacy BIFF format — openpyxl cannot read this
+            wb = xlrd.open_workbook(xlsx_path)
+            out = []
+            for sheet in wb.sheets():
+                out.append(f'Sheet: {sheet.name}')
+                for rx in range(sheet.nrows):
+                    row = [str(sheet.cell_value(rx, cx)) for cx in range(sheet.ncols)]
+                    line = ','.join(v for v in row if v.strip())
+                    if line:
+                        out.append(line)
+                    if len(out) >= 1000:
+                        break
+            return '\n'.join(out[:1000])
+        else:
+            wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+            out = []
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                out.append(f'Sheet: {sheet}')
+                for row in ws.iter_rows(values_only=True):
+                    if any(v is not None for v in row):
+                        out.append(','.join(str(v) if v is not None else '' for v in row))
+                    if len(out) >= 1000:
+                        break
+            return '\n'.join(out[:1000])
+    except Exception as e:
+        print(f"Excel extraction failed ({xlsx_path}): {e}")
         return ''
+
+def extract_docx_text(docx_path: str) -> str:
+    """Extract text from .docx using the public python-docx API."""
+    try:
+        doc = python_docx.Document(docx_path)
+        parts = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                seen = []
+                for c in cells:
+                    if c and (not seen or c != seen[-1]):
+                        seen.append(c)
+                line = '\t'.join(seen)
+                if line:
+                    parts.append(line)
+        return '\n'.join(parts)
+    except Exception as e:
+        print(f"DOCX extraction failed: {e}")
+        return ''
+
+def _extract_file_text(file_path: str, filename: str) -> str:
+    """Route a file to the correct extractor by extension."""
+    f = filename.lower()
+    if f.endswith('.pdf'):
+        return extract_pdf_text(file_path)
+    elif f.endswith('.docx'):
+        return extract_docx_text(file_path)
+    elif f.endswith(('.xlsx', '.xls', '.csv')):
+        return extract_excel_text(file_path)
+    return ''
 
 def clean_json(text: str) -> str:
     text = re.sub(r'^```json\s*', '', text, flags=re.M)
@@ -283,14 +475,31 @@ def clean_json(text: str) -> str:
 # ── SSE helper ────────────────────────────────────────────────────────────────
 
 def sse_event(event: str, data: dict) -> str:
-    """Format a Server-Sent Event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 # ── Request model ─────────────────────────────────────────────────────────────
 
 class PipelineRequest(BaseModel):
-    storagePath: str
-    filename: str
+    # Multi-file (new)
+    storagePaths: Optional[list[str]] = None
+    filenames:    Optional[list[str]] = None
+    # Single-file (legacy — backwards compat)
+    storagePath:  Optional[str]       = None
+    filename:     Optional[str]       = None
+
+    def resolved_paths(self) -> list[str]:
+        if self.storagePaths:
+            return self.storagePaths
+        if self.storagePath:
+            return [self.storagePath]
+        raise ValueError("No storage path provided")
+
+    def resolved_filenames(self) -> list[str]:
+        if self.filenames:
+            return self.filenames
+        if self.filename:
+            return [self.filename]
+        return [p.split('/')[-1] for p in self.resolved_paths()]
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -302,8 +511,8 @@ def health():
 async def pipeline(req: PipelineRequest):
     """
     Streaming pipeline endpoint using Server-Sent Events.
-    Emits progress events then a final 'complete' event with full results.
 
+    Accepts single file (legacy) or multiple files/ZIP (new).
     Event types:
       progress  — { step, label, detail? }
       error     — { message }
@@ -311,82 +520,137 @@ async def pipeline(req: PipelineRequest):
     """
 
     async def generate():
-        work_dir = tempfile.mkdtemp(prefix='acquira-')
+        work_dir      = tempfile.mkdtemp(prefix='acquira-')
+        storage_paths = req.resolved_paths()
+        all_filenames = req.resolved_filenames()
+
         try:
-            # ── Step 1: Download & parse ──────────────────────────────────
+            # ── Step 1: Download & parse all files ───────────────────────
             yield sse_event("progress", {
                 "step": 1, "total": 5,
-                "label": "Downloading file",
-                "detail": req.filename
+                "label": "Downloading files",
+                "detail": f"{len(storage_paths)} file{'s' if len(storage_paths) != 1 else ''}"
             })
 
-            response    = supabase.storage.from_('uploads').download(req.storagePath)
-            file_bytes  = response
-            filename    = req.filename.lower()
+            # Text budget per file class: (max_chars_per_file, max_file_count)
+            # Keeps combined_text under ~120k chars even with 30 files.
+            TEXT_BUDGET: dict[str, tuple[int, int]] = {
+                'im_pdf':               (50000, 3),
+                'im_docx':              (50000, 3),
+                'pl_excel':             (10000, 10),
+                'occupancy_excel':      (10000, 10),
+                'transaction_excel':    (8000,  5),
+                'payroll_excel':        (8000,  5),
+                'lease_pdf':            (8000,  5),
+                'lease_docx':           (8000,  5),
+                'service_approval_pdf': (4000,  3),
+                'nqs_pdf':              (4000,  3),
+            }
+            CLAUDE_CHAR_LIMIT = 120_000
 
+            class_counts: dict[str, int] = {}
             combined_text = ''
-            source_files  = []
-            file_classes  = {}
+            source_files:  list[str] = []
+            file_classes:  dict[str, str] = {}
+            skipped:       list[str] = []
 
-            if filename.endswith('.zip'):
-                zip_path = os.path.join(work_dir, 'upload.zip')
-                with open(zip_path, 'wb') as f:
-                    f.write(file_bytes)
+            for storage_path, filename in zip(storage_paths, all_filenames):
+                fname_lower = filename.lower()
+                file_bytes  = supabase.storage.from_('uploads').download(storage_path)
 
-                yield sse_event("progress", {
-                    "step": 1, "total": 5,
-                    "label": "Unpacking ZIP",
-                    "detail": "Reading data room files"
-                })
+                # ── ZIP: extract contained files ──────────────────────────
+                if fname_lower.endswith('.zip'):
+                    yield sse_event("progress", {
+                        "step": 1, "total": 5,
+                        "label": "Unpacking ZIP",
+                        "detail": filename
+                    })
+                    zip_path = os.path.join(work_dir, 'upload.zip')
+                    with open(zip_path, 'wb') as f:
+                        f.write(file_bytes)
 
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    for entry_name in zf.namelist():
-                        base_name = Path(entry_name).name
-                        if not base_name or base_name.startswith('.'): continue
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        for entry_name in zf.namelist():
+                            base_name = Path(entry_name).name
+                            if not base_name or base_name.startswith('.'): continue
 
-                        file_class = classify_file(base_name)
-                        file_classes[base_name] = file_class
-                        if file_class == 'unknown': continue
+                            file_class = classify_file(base_name)
+                            if file_class == 'unknown': continue
 
-                        entry_path = os.path.join(work_dir, re.sub(r'[^a-zA-Z0-9._-]', '_', base_name))
-                        with open(entry_path, 'wb') as f:
-                            f.write(zf.read(entry_name))
-                        source_files.append(base_name)
+                            max_chars, max_count = TEXT_BUDGET.get(file_class, (4000, 3))
+                            if class_counts.get(file_class, 0) >= max_count:
+                                skipped.append(base_name)
+                                continue
 
-                        if base_name.endswith('.pdf'):
-                            text = extract_pdf_text(entry_path)
-                            if is_pdf_scanned(text):
+                            entry_path = os.path.join(
+                                work_dir, re.sub(r'[^a-zA-Z0-9._-]', '_', base_name)
+                            )
+                            with open(entry_path, 'wb') as f:
+                                f.write(zf.read(entry_name))
+
+                            text = _extract_file_text(entry_path, base_name)
+
+                            # Vision fallback for scanned PDFs
+                            if base_name.lower().endswith('.pdf') and is_pdf_scanned(text):
                                 yield sse_event("progress", {
                                     "step": 1, "total": 5,
                                     "label": "Reading scanned PDF",
                                     "detail": base_name
                                 })
-                                text = await extract_scanned_pdf_text(entry_path, file_class.replace('_', ' '))
-                            combined_text += f'\n\n=== {base_name} ({file_class}) ===\n{text}'
-                        elif base_name.endswith(('.xlsx', '.xls')):
-                            combined_text += f'\n\n=== {base_name} ({file_class}) ===\n{extract_excel_text(entry_path)}'
+                                text = await extract_scanned_pdf_text(
+                                    entry_path, file_class.replace('_', ' ')
+                                )
 
-            elif filename.endswith('.pdf'):
-                pdf_path = os.path.join(work_dir, 'input.pdf')
-                with open(pdf_path, 'wb') as f:
-                    f.write(file_bytes)
-                source_files.append(req.filename)
+                            if text:
+                                combined_text += f'\n\n=== {base_name} ({file_class}) ===\n{text[:max_chars]}'
+                                source_files.append(base_name)
+                                file_classes[base_name] = file_class
+                                class_counts[file_class] = class_counts.get(file_class, 0) + 1
 
-                text = extract_pdf_text(pdf_path)
-                if is_pdf_scanned(text):
-                    yield sse_event("progress", {
-                        "step": 1, "total": 5,
-                        "label": "Reading scanned PDF",
-                        "detail": "Using vision extraction"
-                    })
-                    text = await extract_scanned_pdf_text(pdf_path, 'Information Memorandum')
-                combined_text = text
-            else:
-                yield sse_event("error", {"message": "Unsupported file type. Upload a PDF or ZIP."})
-                return
+                # ── Single file ───────────────────────────────────────────
+                else:
+                    file_class = classify_file(filename)
+                    if file_class == 'unknown':
+                        skipped.append(filename)
+                        continue
+
+                    max_chars, max_count = TEXT_BUDGET.get(file_class, (30000, 1))
+                    if class_counts.get(file_class, 0) >= max_count:
+                        skipped.append(filename)
+                        continue
+
+                    file_path = os.path.join(
+                        work_dir, re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
+                    )
+                    with open(file_path, 'wb') as f:
+                        f.write(file_bytes)
+
+                    text = _extract_file_text(file_path, filename)
+
+                    # Vision fallback for scanned PDFs
+                    if fname_lower.endswith('.pdf') and is_pdf_scanned(text):
+                        yield sse_event("progress", {
+                            "step": 1, "total": 5,
+                            "label": "Reading scanned PDF",
+                            "detail": "Using vision extraction"
+                        })
+                        text = await extract_scanned_pdf_text(
+                            file_path, file_class.replace('_', ' ')
+                        )
+
+                    if text:
+                        combined_text += f'\n\n=== {filename} ({file_class}) ===\n{text[:max_chars]}'
+                        source_files.append(filename)
+                        file_classes[filename] = file_class
+                        class_counts[file_class] = class_counts.get(file_class, 0) + 1
+                    else:
+                        skipped.append(filename)
+
+            if skipped:
+                print(f"[pipeline] skipped {len(skipped)} file(s): {skipped}")
 
             if not combined_text.strip():
-                yield sse_event("error", {"message": "Could not extract text from file."})
+                yield sse_event("error", {"message": "Could not extract text from any uploaded file."})
                 return
 
             # ── Step 2: Extract ───────────────────────────────────────────
@@ -399,17 +663,20 @@ async def pipeline(req: PipelineRequest):
             extraction_response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                temperature=0,   # deterministic extraction
+                temperature=0,
                 system=EXTRACTION_SYSTEM_PROMPT,
                 messages=[{
                     "role": "user",
-                    "content": f"Extract structured data from this childcare centre document.\n\nSource files: {', '.join(source_files)}\n\nCONTENT:\n{combined_text[:60000]}"
+                    "content": (
+                        f"Extract structured data from this childcare centre document.\n\n"
+                        f"Source files: {', '.join(source_files)}\n\n"
+                        f"CONTENT:\n{combined_text[:CLAUDE_CHAR_LIMIT]}"
+                    )
                 }]
             )
             extracted_text = clean_json(extraction_response.content[0].text)
             extracted      = json.loads(extracted_text)
-
-            centre_name = extracted.get('centre', {}).get('name') or 'centre'
+            centre_name    = extracted.get('centre', {}).get('name') or 'centre'
 
             # ── Step 3: Score ─────────────────────────────────────────────
             yield sse_event("progress", {
@@ -421,17 +688,59 @@ async def pipeline(req: PipelineRequest):
             scoring_response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                temperature=0,   # deterministic scoring — same IM always same score
+                temperature=0,
                 system=SCORING_SYSTEM_PROMPT,
                 messages=[{
                     "role": "user",
-                    "content": f"Score this childcare centre acquisition.\n\nEXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                    "content": (
+                        "Score this childcare centre acquisition.\n\n"
+                        "IMPORTANT: Use normalised_ebitda for profitability and valuation scoring "
+                        "if addbacks are present and confidence is 'high' or 'medium'. "
+                        "Always state in the dimension summary whether you used reported or normalised EBITDA "
+                        "and why.\n\n"
+                        f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                    )
                 }]
             )
             scored_text = clean_json(scoring_response.content[0].text)
             scored      = json.loads(scored_text)
 
-            # ── Step 4: Clean up storage ──────────────────────────────────
+            # ── Server recalculates total_score — never trust Claude's value ──
+            WEIGHTS = {
+                'occupancy_demand':        0.15,
+                'profitability_cashflow':  0.15,
+                'revenue_pricing':         0.08,
+                'staffing_resilience':     0.08,
+                'lease_economics':         0.08,
+                'valuation_structure':     0.08,
+                'market_position':         0.07,
+                'management_systems':      0.06,
+                'regulatory_quality':      0.05,
+                'upside_levers':           0.05,
+                'ccs_risk':                0.03,
+                'lease_tail':              0.03,
+                'capex_liability':         0.02,
+                'staff_qualification_mix': 0.02,
+                'fee_benchmarking':        0.02,
+                'operator_quality':        0.02,
+                'enrolment_trend':         0.01,
+            }
+            dims = scored.get('dimensions', {})
+            weighted_sum  = 0.0
+            weight_used   = 0.0
+            for dim_id, weight in WEIGHTS.items():
+                dim = dims.get(dim_id, {})
+                raw = dim.get('score')
+                if isinstance(raw, (int, float)) and 0 <= raw <= 10:
+                    weighted_sum += raw * weight
+                    weight_used  += weight
+            if weight_used > 0:
+                # weighted_sum is in 0-10 range; scale to 0-100
+                scored['total_score'] = round((weighted_sum / weight_used) * 10, 1)
+            scored['scoring_version']  = '2.1'
+            scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
+
+            # ── Step 4: Clean up ALL uploaded paths ───────────────────────
             yield sse_event("progress", {
                 "step": 4, "total": 5,
                 "label": "Generating report",
@@ -439,7 +748,7 @@ async def pipeline(req: PipelineRequest):
             })
 
             try:
-                supabase.storage.from_('uploads').remove([req.storagePath])
+                supabase.storage.from_('uploads').remove(storage_paths)
             except Exception:
                 pass
 
@@ -451,10 +760,14 @@ async def pipeline(req: PipelineRequest):
             })
 
             yield sse_event("complete", {
-                "success": True,
+                "success":   True,
                 "extracted": extracted,
-                "scored": scored,
-                "meta": {"source_files": source_files, "file_classes": file_classes}
+                "scored":    scored,
+                "meta": {
+                    "source_files":  source_files,
+                    "file_classes":  file_classes,
+                    "skipped_files": skipped,
+                }
             })
 
         except Exception as e:
@@ -468,6 +781,6 @@ async def pipeline(req: PipelineRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # disable nginx buffering on Railway
+            "X-Accel-Buffering": "no",
         }
     )
