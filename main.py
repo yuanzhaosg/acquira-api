@@ -174,11 +174,14 @@ occupancy_demand:
   1-2:  occ < 45%, critical
 
 profitability_cashflow:
-  9-10: EBITDA margin >= 25%
+  9-10: EBITDA margin >= 25%, positive 3yr trend
   7-8:  margin 18-24%
   5-6:  margin 10-17%
   3-4:  margin 3-9%
   1-2:  margin < 3% or negative
+  IMPORTANT: If 3yr average EBITDA is negative even when FY25 is positive,
+  cap this score at 4.0 maximum and note the sustained loss history.
+  Use normalised_ebitda if addbacks are verified.
 
 staffing_resilience:
   9-10: labour ratio < 52%
