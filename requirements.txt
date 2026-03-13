@@ -6,3 +6,5 @@ pymupdf==1.24.10
 openpyxl==3.1.5
 supabase==2.7.4
 python-multipart==0.0.12
+python-docx>=1.1.0
+xlrd>=2.0.1
