@@ -1,12 +1,32 @@
-import os, json, re, base64, tempfile, shutil
+import os, json, re, base64, tempfile, shutil, time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import anthropic
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+# Simple in-memory token-bucket: max 5 requests per 60-second sliding window per IP.
+_rate_limit_store: dict[str, list[float]] = {}
+RATE_LIMIT_MAX     = 5
+RATE_LIMIT_WINDOW  = 60  # seconds
+
+def check_rate_limit(ip: str) -> bool:
+    """Return True if the request is allowed, False if rate-limited."""
+    now = time.monotonic()
+    window_start = now - RATE_LIMIT_WINDOW
+    timestamps = _rate_limit_store.get(ip, [])
+    # Evict timestamps outside the sliding window
+    timestamps = [t for t in timestamps if t > window_start]
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        _rate_limit_store[ip] = timestamps
+        return False
+    timestamps.append(now)
+    _rate_limit_store[ip] = timestamps
+    return True
 import pdfplumber
 import fitz  # pymupdf
 import openpyxl
@@ -511,7 +531,7 @@ def health():
     return {"status": "ok"}
 
 @app.post("/pipeline")
-async def pipeline(req: PipelineRequest):
+async def pipeline(req: PipelineRequest, request: Request):
     """
     Streaming pipeline endpoint using Server-Sent Events.
 
@@ -526,6 +546,15 @@ async def pipeline(req: PipelineRequest):
         work_dir      = tempfile.mkdtemp(prefix='acquira-')
         storage_paths = req.resolved_paths()
         all_filenames = req.resolved_filenames()
+
+        # ── Rate limit check ─────────────────────────────────────────────
+        ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+        if not check_rate_limit(ip):
+            yield sse_event("error", {"message": "Rate limit exceeded. Please wait 60 seconds before retrying."})
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return
+
+        print(f"[pipeline] ip={ip} files={len(storage_paths)} ts={datetime.now().isoformat()}")
 
         try:
             # ── Step 1: Download & parse all files ───────────────────────
@@ -663,20 +692,24 @@ async def pipeline(req: PipelineRequest):
                 "detail": f"Reading {len(source_files)} file{'s' if len(source_files) != 1 else ''} · {len(combined_text):,} characters"
             })
 
-            extraction_response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                temperature=0,
-                system=EXTRACTION_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Extract structured data from this childcare centre document.\n\n"
-                        f"Source files: {', '.join(source_files)}\n\n"
-                        f"CONTENT:\n{combined_text[:CLAUDE_CHAR_LIMIT]}"
-                    )
-                }]
-            )
+            try:
+                extraction_response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    temperature=0,
+                    system=EXTRACTION_SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"Extract structured data from this childcare centre document.\n\n"
+                            f"Source files: {', '.join(source_files)}\n\n"
+                            f"CONTENT:\n{combined_text[:CLAUDE_CHAR_LIMIT]}"
+                        )
+                    }]
+                )
+            except anthropic.RateLimitError:
+                yield sse_event("error", {"message": "AI service is temporarily overloaded. Please try again in a few moments."})
+                return
             extracted_text = clean_json(extraction_response.content[0].text)
             extracted      = json.loads(extracted_text)
             centre_name    = extracted.get('centre', {}).get('name') or 'centre'
@@ -688,23 +721,27 @@ async def pipeline(req: PipelineRequest):
                 "detail": f"Analysing {centre_name}"
             })
 
-            scoring_response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                temperature=0,
-                system=SCORING_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Score this childcare centre acquisition.\n\n"
-                        "IMPORTANT: Use normalised_ebitda for profitability and valuation scoring "
-                        "if addbacks are present and confidence is 'high' or 'medium'. "
-                        "Always state in the dimension summary whether you used reported or normalised EBITDA "
-                        "and why.\n\n"
-                        f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
-                    )
-                }]
-            )
+            try:
+                scoring_response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    temperature=0,
+                    system=SCORING_SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Score this childcare centre acquisition.\n\n"
+                            "IMPORTANT: Use normalised_ebitda for profitability and valuation scoring "
+                            "if addbacks are present and confidence is 'high' or 'medium'. "
+                            "Always state in the dimension summary whether you used reported or normalised EBITDA "
+                            "and why.\n\n"
+                            f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                        )
+                    }]
+                )
+            except anthropic.RateLimitError:
+                yield sse_event("error", {"message": "AI service is temporarily overloaded during scoring. Extraction succeeded — please retry shortly."})
+                return
             scored_text = clean_json(scoring_response.content[0].text)
             scored      = json.loads(scored_text)
 
