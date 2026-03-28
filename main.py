@@ -153,10 +153,10 @@ staffing_resilience:     0.08
 lease_economics:         0.08
 valuation_structure:     0.08
 market_position:         0.07
-management_systems:      0.06
+management_systems:      0.04
 regulatory_quality:      0.05
-upside_levers:           0.05
-ccs_risk:                0.03
+upside_levers:           0.03
+ccs_risk:                0.07
 lease_tail:              0.03
 capex_liability:         0.02
 staff_qualification_mix: 0.02
@@ -182,6 +182,10 @@ profitability_cashflow:
   IMPORTANT: If 3yr average EBITDA is negative even when FY25 is positive,
   cap this score at 4.0 maximum and note the sustained loss history.
   Use normalised_ebitda if addbacks are verified.
+  Stress test: model a +10% wage cost increase (apply to total_labour_cost).
+  If the resulting EBITDA drops below 0, flag HIGH RISK: Wage stress wipes EBITDA.
+  If the resulting defensive yield (stressed EBITDA / asking_price) falls below 4.5%, flag HIGH RISK: Defensive yield below 4.5% under wage stress.
+  State the stressed EBITDA and stressed yield in your summary.
 
 staffing_resilience:
   9-10: labour ratio < 52%
@@ -224,6 +228,14 @@ market_position:
   5-6:  average competition
   3-4:  oversupplied market
   1-2:  heavily oversupplied
+  Saturation penalty: apply a haircut to your initial score based on competitor count within 3km:
+    1-2 competitors: -10% (multiply score by 0.90)
+    3 competitors:   -15% (multiply score by 0.85)
+    4-5 competitors: -25% (multiply score by 0.75)
+    6+ competitors:  -35% (multiply score by 0.65)
+  State the multiplier used in your summary.
+  Approved-but-unbuilt centres: if the IM or context mentions DA-approved or under-construction centres nearby,
+  apply an additional -20% penalty and flag Pipeline supply risk.
 
 management_systems:
   7-8:  professional management team, strong systems, not owner-dependent
@@ -248,6 +260,14 @@ ccs_risk:
   5-6:  moderate CCS dependency
   3-4:  high CCS dependency, activity test risk
   1-2:  critical CCS exposure
+  Cohort risk: estimate the % of revenue derived from the 3-5 age group (kindy/preschool cohort).
+  If that % is >40% AND the IM mentions Pre-Prep, kindy, or preschool competition nearby,
+  flag HIGH RISK: Systematic cohort loss risk. Add cohort_35_pct_estimated to the detail block.
+  Revenue topology: classify the CCS revenue routing as one of:
+    Direct (government pays centre directly) → LOW risk,
+    Parent-routed (subsidy flows via parent) → MEDIUM risk,
+    Program-dependent (tied to a specific govt program that could end) → HIGH risk.
+  State the classification and rationale in your summary.
 
 capex_liability:
   9-10: new fit-out, no CAPEX required
@@ -267,6 +287,9 @@ fee_benchmarking:
   5-6:  fees within 5% of median
   3-4:  fees > 5% below median
   1-2:  fees significantly below market
+  Fee ceiling risk: if the centre's daily fee is at or above the suburb's top quartile (estimated as median + 10%)
+  AND no premium differentiation is noted (e.g. no Reggio, Forest School, specialty program, Exceeding NQS),
+  flag Fee ceiling risk and cap this dimension score at 5.0 maximum.
 
 operator_quality:
   9-10: Exceeding NQS, no conditions/notices, strong compliance history
@@ -717,16 +740,17 @@ async def pipeline(req: PipelineRequest):
                 'lease_economics':         0.08,
                 'valuation_structure':     0.08,
                 'market_position':         0.07,
-                'management_systems':      0.06,
+                'management_systems':      0.04,  # was 0.06; reduced to fund ccs_risk increase
                 'regulatory_quality':      0.05,
-                'upside_levers':           0.05,
-                'ccs_risk':                0.03,
+                'upside_levers':           0.03,  # was 0.05; reduced to fund ccs_risk increase
+                'ccs_risk':                0.07,  # was 0.03; increased — CCS risk is systemic
                 'lease_tail':              0.03,
                 'capex_liability':         0.02,
                 'staff_qualification_mix': 0.02,
                 'fee_benchmarking':        0.02,
                 'operator_quality':        0.02,
                 'enrolment_trend':         0.01,
+                # Total: 1.00 ✓
             }
             dims = scored.get('dimensions', {})
             weighted_sum  = 0.0
@@ -740,7 +764,7 @@ async def pipeline(req: PipelineRequest):
             if weight_used > 0:
                 # weighted_sum is in 0-10 range; scale to 0-100
                 scored['total_score'] = round((weighted_sum / weight_used) * 10, 1)
-            scored['scoring_version']  = '2.1'
+            scored['scoring_version']  = '2.2'
             scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
 
             # ── Step 4: Clean up ALL uploaded paths ───────────────────────
