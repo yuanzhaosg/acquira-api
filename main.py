@@ -1,10 +1,10 @@
 import os, json, re, base64, tempfile, shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-from fastapi import FastAPI
+from typing import Optional, List
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import anthropic
 import pdfplumber
@@ -126,8 +126,17 @@ Return this exact JSON structure (set fields to null if not found):
     "labour_ratio_fy25_pct": null, "rent_ratio_fy25_pct": null,
     "ebitda_3yr_avg": null, "rent_pa_fy25": null, "licensed_places": null,
     "asking_price": null, "ebitda_multiple": null
-  }
-}"""
+  },
+  "pipeline_mentions": []
+}
+
+PIPELINE MENTIONS: Extract any mentions of:
+- Approved DAs or council planning applications for childcare/early learning nearby
+- Competitor centres under construction or recently opened
+- Sites approved for childcare development in the area
+- Any new supply risks mentioned in the document
+Store as an array of strings, e.g. ["DA approved at 45 Smith St for 90-place centre", "New childcare under construction 500m away"]
+If none found, return an empty array []."""
 
 SCORING_SYSTEM_PROMPT = """You are an expert childcare acquisition analyst for Acquira. You receive structured data extracted from a childcare centre Information Memorandum (IM) and score it across 17 dimensions.
 
@@ -236,6 +245,11 @@ market_position:
   State the multiplier used in your summary.
   Approved-but-unbuilt centres: if the IM or context mentions DA-approved or under-construction centres nearby,
   apply an additional -20% penalty and flag Pipeline supply risk.
+  DA Pipeline: if the user has provided pipeline_intel (approved DAs, lodged applications, permit sites for sale),
+  incorporate this into the market_position score.
+  Approved DAs within 3km that add >25% of the centre's licensed places = HIGH pipeline risk, reduce score by 2 points minimum.
+  Approved DAs >50% of licensed places = CRITICAL pipeline risk, reduce by 3-4 points.
+  State the pipeline risk explicitly in the summary (e.g. "HIGH pipeline risk: X approved DAs add Y places within 3km").
 
 management_systems:
   7-8:  professional management team, strong systems, not owner-dependent
@@ -505,6 +519,12 @@ def sse_event(event: str, data: dict) -> str:
 
 # ── Request model ─────────────────────────────────────────────────────────────
 
+class PipelineIntel(BaseModel):
+    approved_das: Optional[int] = None
+    lodged_applications: Optional[int] = None
+    permit_sites: Optional[int] = None
+    notes: Optional[str] = None
+
 class PipelineRequest(BaseModel):
     # Multi-file (new)
     storagePaths: Optional[list[str]] = None
@@ -512,6 +532,8 @@ class PipelineRequest(BaseModel):
     # Single-file (legacy — backwards compat)
     storagePath:  Optional[str]       = None
     filename:     Optional[str]       = None
+    # Pipeline intelligence (optional)
+    pipelineIntel: Optional[PipelineIntel] = None
 
     def resolved_paths(self) -> list[str]:
         if self.storagePaths:
@@ -640,6 +662,265 @@ async def demographics(postcode: str):
         "dual_income_pct_estimated": 62,
         "ccs_eligibility_estimated": "high",
     }
+
+# ── P6: DA Pipeline helpers ───────────────────────────────────────────────────
+
+CHILDCARE_KEYWORDS = [
+    "child care", "childcare", "early learning", "early childhood",
+    "education centre", "kindergarten", "kinder"
+]
+
+def extract_places_from_description(description: str) -> Optional[int]:
+    """Extract a number of licensed places from a DA description."""
+    patterns = [
+        r'(\d+)\s*(?:child\s*)?places',
+        r'(\d+)\s*children',
+        r'(\d+)\s*child\s*places',
+        r'(\d+)[- ]place',
+    ]
+    for pat in patterns:
+        m = re.search(pat, description, re.I)
+        if m:
+            return int(m.group(1))
+    return None
+
+def classify_da_status(description: str) -> str:
+    """Classify a DA status from its description."""
+    desc_lower = description.lower()
+    if any(w in desc_lower for w in ["approved", "granted", "permit issued", "development approval"]):
+        return "approved"
+    if any(w in desc_lower for w in ["refused", "rejected", "not approved"]):
+        return "refused"
+    if any(w in desc_lower for w in ["lodged", "submitted", "under assessment", "application received"]):
+        return "lodged"
+    return "unknown"
+
+def assess_pipeline_risk(applications: list, existing_licensed_places: int) -> dict:
+    """Assess supply risk from DA pipeline."""
+    approved_places = sum(
+        a.get("places") or 0
+        for a in applications
+        if a.get("status") == "approved" and a.get("places")
+    )
+    if existing_licensed_places > 0:
+        ratio = approved_places / existing_licensed_places
+    else:
+        ratio = 0
+
+    if ratio > 0.5:
+        risk_level = "HIGH"
+    elif ratio > 0.25:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    return {
+        "risk_level": risk_level,
+        "approved_pipeline_places": approved_places,
+        "ratio_to_licensed": round(ratio, 2),
+    }
+
+
+@app.get("/planning/nearby")
+async def planning_nearby(
+    postcode: str = Query(..., description="Postcode to search"),
+    suburb: Optional[str] = Query(None),
+    state: str = Query("VIC"),
+    radius_km: float = Query(2.0),
+):
+    """
+    Returns nearby DA applications for childcare centres.
+    Uses PlanningAlerts API if PLANNING_ALERTS_API_KEY is set, otherwise mock data.
+    """
+    api_key = os.environ.get("PLANNING_ALERTS_API_KEY")
+
+    if api_key and suburb:
+        # Live data from PlanningAlerts
+        try:
+            import urllib.request as ur
+            url = (
+                f"https://api.planningalerts.org.au/applications.js"
+                f"?key={api_key}&suburb={suburb}&state={state}&count=200"
+            )
+            req = ur.Request(url, headers={"Accept": "application/json"}, method="GET")
+            with ur.urlopen(req, timeout=10) as resp:
+                raw = json.loads(resp.read().decode())
+
+            applications = []
+            for item in (raw if isinstance(raw, list) else raw.get("applications", [])):
+                desc = item.get("description") or ""
+                # Filter for childcare keywords
+                if not any(kw in desc.lower() for kw in CHILDCARE_KEYWORDS):
+                    continue
+                places = extract_places_from_description(desc)
+                status = classify_da_status(desc)
+                applications.append({
+                    "address":       item.get("address"),
+                    "description":   desc,
+                    "status":        status,
+                    "date":          item.get("date_received") or item.get("date_scraped"),
+                    "places":        places,
+                    "distance_km":   None,
+                    "info_url":      item.get("info_url"),
+                    "on_notice_from": item.get("on_notice_from"),
+                    "on_notice_to":   item.get("on_notice_to"),
+                })
+
+            approved = [a for a in applications if a["status"] == "approved"]
+            lodged   = [a for a in applications if a["status"] == "lodged"]
+            refused  = [a for a in applications if a["status"] == "refused"]
+            total_approved_places  = sum(a["places"] or 0 for a in approved)
+            total_pipeline_places  = sum(a["places"] or 0 for a in lodged)
+            risk_flag = total_approved_places > 0
+            risk_note = (
+                f"{len(approved)} approved DA{'s' if len(approved) != 1 else ''} add "
+                f"{total_approved_places} pipeline places within search area"
+                if risk_flag else "No approved childcare DAs found in search area"
+            )
+
+            return {
+                "source": "live",
+                "postcode": postcode,
+                "suburb": suburb,
+                "state": state,
+                "applications": applications,
+                "summary": {
+                    "total": len(applications),
+                    "approved": len(approved),
+                    "lodged": len(lodged),
+                    "refused": len(refused),
+                    "total_approved_places": total_approved_places,
+                    "total_pipeline_places": total_pipeline_places,
+                    "risk_flag": risk_flag,
+                    "risk_note": risk_note,
+                }
+            }
+        except Exception as e:
+            print(f"[planning/nearby] Live fetch failed: {e}. Falling back to mock.")
+
+    # Mock data
+    suburb_display = suburb or "Forest Hill"
+    return {
+        "source": "mock",
+        "note": "Set PLANNING_ALERTS_API_KEY env var to enable live data",
+        "postcode": postcode,
+        "suburb": suburb_display,
+        "state": state,
+        "applications": [
+            {
+                "address": f"45 Example St, {suburb_display} VIC {postcode}",
+                "description": "Construction of a child care centre (90 places)",
+                "status": "approved",
+                "date": "2025-08-14",
+                "places": 90,
+                "distance_km": 1.2,
+                "info_url": None,
+            },
+            {
+                "address": f"12 Sample Ave, Nunawading VIC 3131",
+                "description": "Early learning centre - 75 places",
+                "status": "lodged",
+                "date": "2025-11-22",
+                "places": 75,
+                "distance_km": 1.8,
+                "info_url": None,
+            },
+            {
+                "address": f"88 Demo Rd, Blackburn VIC 3130",
+                "description": "Child care centre expansion - additional 30 places",
+                "status": "approved",
+                "date": "2025-06-03",
+                "places": 30,
+                "distance_km": 2.1,
+                "info_url": None,
+            },
+        ],
+        "summary": {
+            "total": 3,
+            "approved": 2,
+            "lodged": 1,
+            "refused": 0,
+            "total_approved_places": 120,
+            "total_pipeline_places": 75,
+            "risk_flag": True,
+            "risk_note": f"2 approved DAs add 120 pipeline places within {radius_km}km — significant supply risk",
+        }
+    }
+
+
+@app.get("/planning/councils")
+async def planning_councils():
+    """
+    Returns a static reference list of major Australian councils with their planning portal URLs.
+    Useful for manual DA research.
+    """
+    return {
+        "source": "static",
+        "last_updated": "2026-03",
+        "councils": {
+            "VIC": [
+                {"name": "Melbourne City Council",        "url": "https://development.melbourne.vic.gov.au/planning-register", "notes": "Search: child care, early learning"},
+                {"name": "Boroondara City Council",       "url": "https://eservices.boroondara.vic.gov.au/datrack/",          "notes": "Search: childcare, early childhood"},
+                {"name": "Monash City Council",           "url": "https://www.monash.vic.gov.au/Planning-Building/Planning/Planning-Applications", "notes": "Search: child care centre"},
+                {"name": "Whitehorse City Council",       "url": "https://www.whitehorse.vic.gov.au/planning-applications",   "notes": "Search: early learning, childcare"},
+                {"name": "Knox City Council",             "url": "https://www.knox.vic.gov.au/planning-permits",              "notes": "Search: child care"},
+                {"name": "Manningham City Council",       "url": "https://www.manningham.vic.gov.au/building-planning/planning/planning-applications", "notes": "Search: early learning centre"},
+                {"name": "Maroondah City Council",        "url": "https://www.maroondah.vic.gov.au/Planning-permits",         "notes": "Search: childcare, kinder"},
+                {"name": "Yarra City Council",            "url": "https://www.yarracity.vic.gov.au/planning-and-building/planning-applications", "notes": "Search: child care, early childhood"},
+                {"name": "Glen Eira City Council",        "url": "https://www.gleneira.vic.gov.au/planning-permits",          "notes": "Search: child care centre"},
+                {"name": "Bayside City Council",          "url": "https://www.bayside.vic.gov.au/planning",                  "notes": "Search: early learning, childcare"},
+                {"name": "Moonee Valley City Council",    "url": "https://www.mvcc.vic.gov.au/planning",                     "notes": "Search: child care"},
+                {"name": "Darebin City Council",          "url": "https://www.darebin.vic.gov.au/planning-building-permits",  "notes": "Search: early childhood, childcare"},
+            ],
+            "NSW": [
+                {"name": "City of Sydney Council",        "url": "https://da.cityofsydney.nsw.gov.au/",                      "notes": "Search: child care centre, early learning"},
+                {"name": "Northern Beaches Council",      "url": "https://www.northernbeaches.nsw.gov.au/services/planning-and-building/development-applications", "notes": "Search: child care"},
+                {"name": "Ku-ring-gai Council",           "url": "https://www.kmc.nsw.gov.au/planning_and_development/development_applications", "notes": "Search: early learning, childcare"},
+                {"name": "Ryde City Council",             "url": "https://www.ryde.nsw.gov.au/Planning/Development-Applications", "notes": "Search: child care centre"},
+                {"name": "Parramatta City Council",       "url": "https://eservices.parracity.nsw.gov.au/datracking/",        "notes": "Search: early childhood, childcare"},
+                {"name": "Blacktown City Council",        "url": "https://www.blacktown.nsw.gov.au/Planning-and-Building/Development-applications", "notes": "Search: child care"},
+                {"name": "Lane Cove Council",             "url": "https://www.lanecove.nsw.gov.au/planning/development-applications/", "notes": "Search: early learning"},
+                {"name": "Willoughby City Council",       "url": "https://www.willoughby.nsw.gov.au/Planning-Building/Development-Applications", "notes": "Search: child care, kinder"},
+                {"name": "Mosman Council",                "url": "https://www.mosman.nsw.gov.au/council/services/planning/development-applications", "notes": "Search: early childhood"},
+                {"name": "Strathfield Council",           "url": "https://www.strathfield.nsw.gov.au/building-planning/development-applications", "notes": "Search: childcare, early learning"},
+                {"name": "Canterbury-Bankstown Council",  "url": "https://www.cbcity.nsw.gov.au/planning-and-building/development-applications", "notes": "Search: child care centre"},
+            ],
+            "QLD": [
+                {"name": "Brisbane City Council",         "url": "https://developmenti.brisbane.qld.gov.au/",                "notes": "Search: child care, early learning"},
+                {"name": "Gold Coast City Council",       "url": "https://eplanning.goldcoast.qld.gov.au/",                  "notes": "Search: childcare, early childhood"},
+                {"name": "Sunshine Coast Council",        "url": "https://eplanning.sunshinecoast.qld.gov.au/",              "notes": "Search: child care centre"},
+                {"name": "Moreton Bay Regional Council",  "url": "https://eplanning.moretonbay.qld.gov.au/",                 "notes": "Search: early learning, childcare"},
+                {"name": "Logan City Council",            "url": "https://eplanning.logan.qld.gov.au/",                      "notes": "Search: child care"},
+                {"name": "Ipswich City Council",          "url": "https://eplanning.ipswich.qld.gov.au/",                    "notes": "Search: early childhood centre"},
+                {"name": "Townsville City Council",       "url": "https://eplanning.townsville.qld.gov.au/",                 "notes": "Search: childcare, child care"},
+                {"name": "Cairns Regional Council",       "url": "https://eplanning.cairns.qld.gov.au/",                     "notes": "Search: early learning"},
+                {"name": "Redland City Council",          "url": "https://eplanning.redland.qld.gov.au/",                    "notes": "Search: child care centre"},
+                {"name": "Toowoomba Regional Council",    "url": "https://eplanning.toowoomba.qld.gov.au/",                  "notes": "Search: childcare, kinder"},
+                {"name": "Rockhampton Regional Council",  "url": "https://eplanning.rockhamptonregion.qld.gov.au/",          "notes": "Search: child care"},
+            ],
+            "WA": [
+                {"name": "City of Perth",                 "url": "https://www.perth.wa.gov.au/planning-development/development-applications", "notes": "Search: child care, early learning"},
+                {"name": "City of Stirling",              "url": "https://www.stirling.wa.gov.au/planning",                  "notes": "Search: childcare centre"},
+                {"name": "City of Joondalup",             "url": "https://www.joondalup.wa.gov.au/planning",                 "notes": "Search: early learning, child care"},
+                {"name": "City of Swan",                  "url": "https://www.swan.wa.gov.au/planning",                     "notes": "Search: childcare"},
+                {"name": "City of Melville",              "url": "https://www.melvillecity.com.au/planning",                 "notes": "Search: child care centre"},
+                {"name": "City of Canning",               "url": "https://www.canning.wa.gov.au/planning",                  "notes": "Search: early childhood"},
+                {"name": "City of Gosnells",              "url": "https://www.gosnells.wa.gov.au/planning",                  "notes": "Search: childcare, child care"},
+                {"name": "City of Wanneroo",              "url": "https://www.wanneroo.wa.gov.au/planning",                  "notes": "Search: early learning"},
+            ],
+            "SA": [
+                {"name": "City of Adelaide",              "url": "https://www.cityofadelaide.com.au/planning",               "notes": "Search: child care, early learning"},
+                {"name": "City of Charles Sturt",         "url": "https://www.charlessturt.sa.gov.au/planning",              "notes": "Search: childcare centre"},
+                {"name": "City of Onkaparinga",           "url": "https://www.onkaparinga.sa.gov.au/planning",               "notes": "Search: early childhood, child care"},
+                {"name": "City of Marion",                "url": "https://www.marion.sa.gov.au/planning",                    "notes": "Search: childcare"},
+                {"name": "City of Tea Tree Gully",        "url": "https://www.teatreegully.sa.gov.au/planning",              "notes": "Search: early learning"},
+                {"name": "City of Salisbury",             "url": "https://www.salisbury.sa.gov.au/planning",                 "notes": "Search: child care centre"},
+                {"name": "City of Port Adelaide Enfield", "url": "https://www.portenf.sa.gov.au/planning",                  "notes": "Search: childcare, kinder"},
+                {"name": "City of Prospect",              "url": "https://www.prospect.sa.gov.au/planning",                  "notes": "Search: early childhood"},
+            ],
+        }
+    }
+
 
 @app.post("/pipeline")
 async def pipeline(req: PipelineRequest):
@@ -819,6 +1100,26 @@ async def pipeline(req: PipelineRequest):
                 "detail": f"Analysing {centre_name}"
             })
 
+            # Build pipeline intel context block if provided
+            pipeline_intel_context = ""
+            pi = req.pipelineIntel
+            if pi:
+                pipeline_intel_context = "\n\nPIPELINE INTEL (user-provided):\n"
+                if pi.approved_das is not None:
+                    pipeline_intel_context += f"- Approved DAs within 3km: {pi.approved_das}\n"
+                if pi.lodged_applications is not None:
+                    pipeline_intel_context += f"- Lodged applications: {pi.lodged_applications}\n"
+                if pi.permit_sites is not None:
+                    pipeline_intel_context += f"- Permit sites for sale: {pi.permit_sites}\n"
+                if pi.notes:
+                    pipeline_intel_context += f"- Notes: {pi.notes}\n"
+                # Also attach extracted pipeline_mentions if any
+                pipeline_mentions = extracted.get("pipeline_mentions", [])
+                if pipeline_mentions:
+                    pipeline_intel_context += f"- Document mentions: {'; '.join(pipeline_mentions)}\n"
+                # Store a flag in scored data so the front-end knows pipeline intel was used
+                extracted["_pipeline_intel_used"] = True
+
             scoring_response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
@@ -833,6 +1134,7 @@ async def pipeline(req: PipelineRequest):
                         "Always state in the dimension summary whether you used reported or normalised EBITDA "
                         "and why.\n\n"
                         f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                        f"{pipeline_intel_context}"
                     )
                 }]
             )
@@ -874,6 +1176,8 @@ async def pipeline(req: PipelineRequest):
                 scored['total_score'] = round((weighted_sum / weight_used) * 10, 1)
             scored['scoring_version']  = '2.2'
             scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
+            if req.pipelineIntel:
+                scored['pipeline_intel_used'] = True
 
             # ── Step 4: Clean up ALL uploaded paths ───────────────────────
             yield sse_event("progress", {
