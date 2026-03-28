@@ -533,6 +533,114 @@ class PipelineRequest(BaseModel):
 def health():
     return {"status": "ok"}
 
+
+# ── P4.1: ACECQA Nearby Centres ───────────────────────────────────────────────
+# TODO: ACECQA does not have a public REST API as of 2026.
+# When one becomes available, replace this stub with a real integration.
+# For now: accepts optional manual entry via query params, returns structured mock.
+@app.get("/acecqa/nearby")
+async def acecqa_nearby(
+    lat: float = None,
+    lng: float = None,
+    radius_km: float = 2.0,
+    postcode: str = None,
+):
+    """
+    Returns nearby ACECQA-registered childcare centres within radius_km.
+    TODO: Automate via ACECQA public API when available.
+    Current implementation returns a structured mock for UI development.
+    """
+    return {
+        "source": "mock",
+        "note": "ACECQA does not provide a public API as of 2026. Integrate with NQS IT system when available.",
+        "query": {"lat": lat, "lng": lng, "radius_km": radius_km, "postcode": postcode},
+        "centres": [
+            {
+                "name": "Sunshine Early Learning Centre",
+                "address": "45 Park St",
+                "suburb": postcode or "Unknown",
+                "nqs_rating": "Meeting NQS",
+                "licensed_places": 60,
+                "distance_km": 0.8,
+                "lat": lat,
+                "lng": lng,
+                "provider": "Private",
+            },
+            {
+                "name": "Little Stars Childcare",
+                "address": "12 Main Rd",
+                "suburb": postcode or "Unknown",
+                "nqs_rating": "Exceeding NQS",
+                "licensed_places": 80,
+                "distance_km": 1.4,
+                "lat": lat,
+                "lng": lng,
+                "provider": "Community",
+            },
+            {
+                "name": "Rainbow Kids Centre",
+                "address": "7 Station Ave",
+                "suburb": postcode or "Unknown",
+                "nqs_rating": "Working Towards NQS",
+                "licensed_places": 45,
+                "distance_km": 1.9,
+                "lat": lat,
+                "lng": lng,
+                "provider": "Private",
+            },
+        ],
+    }
+
+
+# ── P4.2: ABS Demographic Lookup ─────────────────────────────────────────────
+# TODO: ABS Data API (https://api.data.abs.gov.au) is available but requires
+# knowing the correct dataset IDs for small-area population data.
+# The correct dataset for 0-4 population by SA2 is ABS_CENSUS2021_B04.
+# When properly integrated, replace mock below with real ABS API call.
+import urllib.request
+import urllib.error
+
+@app.get("/demographics/{postcode}")
+async def demographics(postcode: str):
+    """
+    Returns catchment demographic data for a postcode.
+    Attempts ABS Data API; falls back to structured mock on failure.
+    TODO: Implement full SA2-level 0-4 population trend from ABS Census data.
+    """
+    # Attempt ABS API
+    try:
+        abs_url = f"https://api.data.abs.gov.au/data/ABS_CENSUS2021_B04/1+2+3..?startPeriod=2021&dimensionAtObservation=AllDimensions&format=jsondata"
+        req = urllib.request.Request(abs_url, headers={"Accept": "application/json"}, method="GET")
+        # Short timeout — fall back to mock if ABS is slow
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            # TODO: parse the correct 0-4 age group for the postcode's SA2
+            pass  # Fall through to mock for now
+    except Exception:
+        pass  # Expected — fall back to mock
+
+    # Structured mock with realistic shape
+    return {
+        "source": "mock",
+        "note": "TODO: Integrate ABS Census 2021 SA2 population data for postcode-to-SA2 mapping. Dataset: ABS_CENSUS2021_B04.",
+        "postcode": postcode,
+        "population_0_4": {
+            "2016": 412,
+            "2021": 385,
+            "trend": "declining",
+            "pct_change_5yr": -6.6,
+            "risk_flag": True,
+            "risk_note": "0-4 population declined 6.6% over 5 years — potential demand headwind.",
+        },
+        "population_total": {
+            "2016": 8200,
+            "2021": 8650,
+            "trend": "stable",
+        },
+        "median_household_income": 104000,
+        "dual_income_pct_estimated": 62,
+        "ccs_eligibility_estimated": "high",
+    }
+
 @app.post("/pipeline")
 async def pipeline(req: PipelineRequest):
     """
