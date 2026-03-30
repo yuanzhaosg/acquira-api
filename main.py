@@ -808,7 +808,7 @@ async def planning_nearby(
         "state": state,
         "applications": [
             {
-                "address": f"45 Example St, {suburb_display} VIC {postcode}",
+                "address": f"45 Example St, {suburb_display} {state} {postcode}",
                 "description": "Construction of a child care centre (90 places)",
                 "status": "approved",
                 "date": "2025-08-14",
@@ -817,7 +817,7 @@ async def planning_nearby(
                 "info_url": None,
             },
             {
-                "address": f"12 Sample Ave, Nunawading VIC 3131",
+                "address": f"12 Sample Ave, Nearby Suburb {state} {postcode}",
                 "description": "Early learning centre - 75 places",
                 "status": "lodged",
                 "date": "2025-11-22",
@@ -826,7 +826,7 @@ async def planning_nearby(
                 "info_url": None,
             },
             {
-                "address": f"88 Demo Rd, Blackburn VIC 3130",
+                "address": f"88 Demo Rd, Adjacent Suburb {state} {postcode}",
                 "description": "Child care centre expansion - additional 30 places",
                 "status": "approved",
                 "date": "2025-06-03",
