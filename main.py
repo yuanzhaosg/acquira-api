@@ -802,7 +802,7 @@ async def planning_nearby(
     suburb_display = suburb or "Forest Hill"
     return {
         "source": "mock",
-        "note": "Set PLANNING_ALERTS_API_KEY env var to enable live data",
+        "note": "Live DA data requires PlanningAlerts API key. Showing illustrative examples only.",
         "postcode": postcode,
         "suburb": suburb_display,
         "state": state,
