@@ -177,11 +177,36 @@ enrolment_trend:         0.01
 SCORING RUBRIC (0-10 per dimension):
 
 occupancy_demand:
-  9-10: occ >= 90%, strong waitlist
-  7-8:  occ 75-89%, some waitlist
-  5-6:  occ 60-74%, stable
-  3-4:  occ 45-59%, declining or flat
-  1-2:  occ < 45%, critical
+  This dimension scores TWO things: (1) internal centre performance, (2) external market demand.
+  Combine both into the final score.
+
+  INTERNAL PERFORMANCE (centre occupancy from IM):
+  +4.0  occ >= 90%, strong waitlist
+  +3.0  occ 75-89%, some waitlist
+  +2.0  occ 60-74%, stable
+  +1.0  occ 45-59%, flat
+  +0.0  occ < 45%, critical
+  +0.5  improving trend confirmed (3+ months)
+  -0.5  declining trend confirmed
+  +0.5  waitlist confirmed
+
+  EXTERNAL MARKET DEMAND — use _demand_context.adj_kids_per_place.mid (EDR) if available:
+  *** DO NOT use any demand ratio from the IM document. Use ONLY _demand_context.edr_mid. ***
+  If _demand_context is present and abs_hit is true:
+    EDR >= 1.2  → +5.0  (strong structural undersupply)
+    EDR 1.0-1.2 → +4.0  (undersupplied)
+    EDR 0.75-1.0 → +3.0 (balanced)
+    EDR 0.5-0.75 → +2.0 (soft)
+    EDR < 0.5   → +1.0  (oversupplied)
+  If _demand_context is absent or abs_hit is false:
+    Use occupancy trend + waitlist as proxy for demand — no external demand score.
+    State clearly: "No ABS demand data available for this postcode."
+
+  Final score = sum of internal + external components, capped at 10.
+
+  CRITICAL: If the IM mentions a kids-per-place or children-per-place figure (e.g. GapMaps 2.81),
+  IGNORE IT. Use only _demand_context.adj_kids_per_place.mid as the demand anchor.
+  State in your summary: "EDR (ABS-adjusted): {_demand_context.adj_kids_per_place.mid}" and the zone.
 
 profitability_cashflow:
   9-10: EBITDA margin >= 25%, positive 3yr trend
@@ -1220,8 +1245,17 @@ async def pipeline(req: PipelineRequest):
                         "if addbacks are present and confidence is 'high' or 'medium'. "
                         "Always state in the dimension summary whether you used reported or normalised EBITDA "
                         "and why.\n\n"
-                        f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
-                        f"{pipeline_intel_context}"
+                        "DEMAND DATA (use for occupancy_demand external score, ignore any IM demand figures):\n"
+                        + (
+                            f"  EDR (adj kids/place): {extracted['_demand_context']['adj_kids_per_place']['mid']}\n"
+                            f"  Zone: {extracted['_demand_context']['zone']}\n"
+                            f"  Confidence: {extracted['_demand_context']['confidence']}\n"
+                            f"  ABS hit: {extracted['_demand_context']['abs_hit']}\n"
+                            f"  Demand trend: {extracted['_demand_context']['demand_trend']}\n"
+                            if extracted.get('_demand_context') else "  No ABS demand data available.\n"
+                        )
+                        + f"\nEXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                        + f"{pipeline_intel_context}"
                     )
                 }]
             )
