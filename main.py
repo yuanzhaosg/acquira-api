@@ -359,6 +359,43 @@ labour_ratio_danger (labour>65% rev), ebitda_negative, lease_short_no_options (<
 lease_short_with_options (<3yr with options), owner_operator_dependency,
 nqs_working_towards, capex_high, ccs_exposure_high, valuation_premium (>4x EBITDA turnaround)
 
+NEXT STEPS — generate for every deal:
+
+next_steps.verdict_plain:
+  2–3 plain-English sentences. Name the centre, suburb, and the single most important factor.
+  Write as if advising a buyer directly. Be blunt. Reference actual numbers.
+  Example: "Kidz R Kidz Cranbourne North trades at 71% occupancy with a 71.4% labour ratio —
+  the business is being run inefficiently and the asking multiple is not justified at current earnings.
+  This is a conditional opportunity only if you can validate the labour cost and confirm occupancy is stable."
+
+next_steps.ask_broker_for:
+  Specific documents or data the buyer should request BEFORE proceeding.
+  Base this on what is MISSING from the extracted data (see audit_trail.fields_missing).
+  And what is flagged but unverified (e.g. addbacks, lease terms, NQS history).
+  Each item must be specific: name the exact document, clause, or number needed.
+  3–5 items maximum. Examples:
+  - "Current staff roster to verify the 71.4% labour ratio — identify agency vs permanent split"
+  - "Executed lease agreement to confirm 4% fixed annual rent review (IM states this but no lease provided)"
+  - "Last 2 NQS Assessment and Rating reports — assessment date unknown, next assessment may be overdue"
+  - "Month-by-month occupancy for the last 12 months — only a single snapshot was provided"
+  - "Owner's salary addback verification — claimed $45K addback but no payroll evidence provided"
+
+next_steps.due_diligence_priorities:
+  2–3 specific due diligence actions for the buyer's own investigation.
+  Focus on the highest-risk dimensions from the score.
+  Examples:
+  - "Commission an independent market rent assessment — rent is at 22% of revenue, above the safe threshold"
+  - "Verify labour ratio with payroll records — a 5pp improvement would add ~$65K EBITDA at current revenue"
+  - "Check ACECQA compliance register for any active conditions or notices on this service approval"
+
+next_steps.deal_structuring_notes:
+  If the deal has specific risks that could be mitigated through deal structure, note them.
+  null if no structuring notes are relevant.
+  Examples:
+  - "Consider a 6-month earnout tied to occupancy reaching 75% before full payment releases"
+  - "Request a 90-day transition period with the outgoing director — owner-operator dependency is high"
+  - "Price should reflect normalised EBITDA, not vendor-claimed addbacks until verified"
+
 Return this exact JSON schema (null for unknowns, never omit keys):
 {
   "centre_name": string,
@@ -395,6 +432,12 @@ Return this exact JSON schema (null for unknowns, never omit keys):
     "category": "passive_hold"|"turnaround"|"distressed"|"pass",
     "one_liner": string,
     "recommended_buyer_profile": string
+  },
+  "next_steps": {
+    "verdict_plain": string,
+    "ask_broker_for": [string],
+    "due_diligence_priorities": [string],
+    "deal_structuring_notes": string | null
   }
 }"""
 
@@ -1295,7 +1338,7 @@ async def pipeline(req: PipelineRequest):
             if weight_used > 0:
                 # weighted_sum is in 0-10 range; scale to 0-100
                 scored['total_score'] = round((weighted_sum / weight_used) * 10, 1)
-            scored['scoring_version']  = '2.3'
+            scored['scoring_version']  = '2.4'
             scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
             if req.pipelineIntel:
                 scored['pipeline_intel_used'] = True
