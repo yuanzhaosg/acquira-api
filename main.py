@@ -5,7 +5,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 import anthropic
 import pdfplumber
 import fitz  # pymupdf
@@ -13,7 +13,6 @@ import openpyxl
 import zipfile
 import docx as python_docx   # python-docx
 import xlrd                   # legacy .xls support
-from demand_service import compute_demand, market_position_score, POSTCODE_AREA_KM2
 from supabase import create_client
 
 app = FastAPI()
@@ -53,6 +52,7 @@ RULES:
 11. Flag unusual patterns or vendor-inflated items in the anomalies array.
 12. Return all numbers as plain JSON numbers. Never use a leading + sign.
 13. labour_ratio_pct >100 or <20 is almost certainly an error - recheck and set to null if unresolvable.
+14. GREENFIELD / PRE-OPENING RULE: If the document describes a brand-new, turn-key, approaching-OC, not-yet-operating, AFL assignment, or lease assignment centre, classify it as greenfield_pre_opening in meta.source_type. Do NOT treat pro-forma EBITDA as actual FY25 EBITDA. Historical occupancy, labour ratio, NQS, and actual EBITDA should remain null unless explicitly provided. Put vendor forecast/pro-forma EBITDA values in meta.anomalies and/or pipeline_mentions rather than fy25.ebitda.
 
 VIC-SPECIFIC CONTEXT:
 - VKF (Vic Kinder Funding) = State Government kindergarten subsidy, counted as revenue.
@@ -177,36 +177,11 @@ enrolment_trend:         0.01
 SCORING RUBRIC (0-10 per dimension):
 
 occupancy_demand:
-  This dimension scores TWO things: (1) internal centre performance, (2) external market demand.
-  Combine both into the final score.
-
-  INTERNAL PERFORMANCE (centre occupancy from IM):
-  +4.0  occ >= 90%, strong waitlist
-  +3.0  occ 75-89%, some waitlist
-  +2.0  occ 60-74%, stable
-  +1.0  occ 45-59%, flat
-  +0.0  occ < 45%, critical
-  +0.5  improving trend confirmed (3+ months)
-  -0.5  declining trend confirmed
-  +0.5  waitlist confirmed
-
-  EXTERNAL MARKET DEMAND — use _demand_context.adj_kids_per_place.mid (EDR) if available:
-  *** DO NOT use any demand ratio from the IM document. Use ONLY _demand_context.edr_mid. ***
-  If _demand_context is present and abs_hit is true:
-    EDR >= 1.2  → +5.0  (strong structural undersupply)
-    EDR 1.0-1.2 → +4.0  (undersupplied)
-    EDR 0.75-1.0 → +3.0 (balanced)
-    EDR 0.5-0.75 → +2.0 (soft)
-    EDR < 0.5   → +1.0  (oversupplied)
-  If _demand_context is absent or abs_hit is false:
-    Use occupancy trend + waitlist as proxy for demand — no external demand score.
-    State clearly: "No ABS demand data available for this postcode."
-
-  Final score = sum of internal + external components, capped at 10.
-
-  CRITICAL: If the IM mentions a kids-per-place or children-per-place figure (e.g. GapMaps 2.81),
-  IGNORE IT. Use only _demand_context.adj_kids_per_place.mid as the demand anchor.
-  State in your summary: "EDR (ABS-adjusted): {_demand_context.adj_kids_per_place.mid}" and the zone.
+  9-10: occ >= 90%, strong waitlist
+  7-8:  occ 75-89%, some waitlist
+  5-6:  occ 60-74%, stable
+  3-4:  occ 45-59%, declining or flat
+  1-2:  occ < 45%, critical
 
 profitability_cashflow:
   9-10: EBITDA margin >= 25%, positive 3yr trend
@@ -258,32 +233,24 @@ valuation_structure:
   1-2:  > 5x EBITDA or POA
 
 market_position:
-  *** IMPORTANT: _market_context.score is pre-computed from real ABS demand data. ***
-  Use it as your anchor. Your job is to EXPLAIN it with deal-specific context, not recompute it.
-
-  The score is based on three deterministic inputs:
-    1. Adjusted kids per place (EDR) = ABS 2021 kids 0-4 × LDC utilisation rate ÷ licensed places in catchment
-    2. Competition density (competitor count within catchment radius)
-    3. Pipeline pressure (approved DA places as ratio of subject capacity)
-
-  How to use _market_context in your summary:
-    - State the EDR: "Adjusted demand ratio: {_market_context.edr_mid} ({_market_context.zone})"
-    - State pipeline risk if present: "Pipeline ratio: {_market_context.pipeline_ratio_subject}x subject capacity"
-    - State confidence: "Confidence: {_market_context.confidence} (ABS postcode data {'found' if abs_hit else 'estimated'})"
-    - Add 1-2 sentences of deal-specific colour: what does this demand picture mean for THIS centre's recovery/growth thesis?
-
-  Score mapping (for reference — use _market_context.score directly):
-    8-10: strong undersupply (EDR ≥ 1.2, low competition, no pipeline)
-    6-8:  balanced market (EDR 0.75-1.2)
-    4-6:  soft market (EDR 0.5-0.75 or high competition)
-    1-4:  oversupplied (EDR < 0.5 or critical pipeline pressure)
-
-  If _market_context is missing or confidence is 'low', fall back to:
-    competitor count heuristic (existing saturation penalty logic), note low confidence.
-
-  Pipeline risk flags (always state explicitly in summary):
-    pipeline_ratio_subject > 0.5 → HIGH pipeline risk
-    pipeline_ratio_subject > 1.0 → CRITICAL pipeline risk
+  9-10: < 1.5 competitors per licensed place within 3km, strong demographics
+  7-8:  balanced supply zone
+  5-6:  average competition
+  3-4:  oversupplied market
+  1-2:  heavily oversupplied
+  Saturation penalty: apply a haircut to your initial score based on competitor count within 3km:
+    1-2 competitors: -10% (multiply score by 0.90)
+    3 competitors:   -15% (multiply score by 0.85)
+    4-5 competitors: -25% (multiply score by 0.75)
+    6+ competitors:  -35% (multiply score by 0.65)
+  State the multiplier used in your summary.
+  Approved-but-unbuilt centres: if the IM or context mentions DA-approved or under-construction centres nearby,
+  apply an additional -20% penalty and flag Pipeline supply risk.
+  DA Pipeline: if the user has provided pipeline_intel (approved DAs, lodged applications, permit sites for sale),
+  incorporate this into the market_position score.
+  Approved DAs within 3km that add >25% of the centre's licensed places = HIGH pipeline risk, reduce score by 2 points minimum.
+  Approved DAs >50% of licensed places = CRITICAL pipeline risk, reduce by 3-4 points.
+  State the pipeline risk explicitly in the summary (e.g. "HIGH pipeline risk: X approved DAs add Y places within 3km").
 
 management_systems:
   7-8:  professional management team, strong systems, not owner-dependent
@@ -359,43 +326,6 @@ labour_ratio_danger (labour>65% rev), ebitda_negative, lease_short_no_options (<
 lease_short_with_options (<3yr with options), owner_operator_dependency,
 nqs_working_towards, capex_high, ccs_exposure_high, valuation_premium (>4x EBITDA turnaround)
 
-NEXT STEPS — generate for every deal:
-
-next_steps.verdict_plain:
-  2–3 plain-English sentences. Name the centre, suburb, and the single most important factor.
-  Write as if advising a buyer directly. Be blunt. Reference actual numbers.
-  Example: "Kidz R Kidz Cranbourne North trades at 71% occupancy with a 71.4% labour ratio —
-  the business is being run inefficiently and the asking multiple is not justified at current earnings.
-  This is a conditional opportunity only if you can validate the labour cost and confirm occupancy is stable."
-
-next_steps.ask_broker_for:
-  Specific documents or data the buyer should request BEFORE proceeding.
-  Base this on what is MISSING from the extracted data (see audit_trail.fields_missing).
-  And what is flagged but unverified (e.g. addbacks, lease terms, NQS history).
-  Each item must be specific: name the exact document, clause, or number needed.
-  3–5 items maximum. Examples:
-  - "Current staff roster to verify the 71.4% labour ratio — identify agency vs permanent split"
-  - "Executed lease agreement to confirm 4% fixed annual rent review (IM states this but no lease provided)"
-  - "Last 2 NQS Assessment and Rating reports — assessment date unknown, next assessment may be overdue"
-  - "Month-by-month occupancy for the last 12 months — only a single snapshot was provided"
-  - "Owner's salary addback verification — claimed $45K addback but no payroll evidence provided"
-
-next_steps.due_diligence_priorities:
-  2–3 specific due diligence actions for the buyer's own investigation.
-  Focus on the highest-risk dimensions from the score.
-  Examples:
-  - "Commission an independent market rent assessment — rent is at 22% of revenue, above the safe threshold"
-  - "Verify labour ratio with payroll records — a 5pp improvement would add ~$65K EBITDA at current revenue"
-  - "Check ACECQA compliance register for any active conditions or notices on this service approval"
-
-next_steps.deal_structuring_notes:
-  If the deal has specific risks that could be mitigated through deal structure, note them.
-  null if no structuring notes are relevant.
-  Examples:
-  - "Consider a 6-month earnout tied to occupancy reaching 75% before full payment releases"
-  - "Request a 90-day transition period with the outgoing director — owner-operator dependency is high"
-  - "Price should reflect normalised EBITDA, not vendor-claimed addbacks until verified"
-
 Return this exact JSON schema (null for unknowns, never omit keys):
 {
   "centre_name": string,
@@ -432,12 +362,6 @@ Return this exact JSON schema (null for unknowns, never omit keys):
     "category": "passive_hold"|"turnaround"|"distressed"|"pass",
     "one_liner": string,
     "recommended_buyer_profile": string
-  },
-  "next_steps": {
-    "verdict_plain": string,
-    "ask_broker_for": [string],
-    "due_diligence_priorities": [string],
-    "deal_structuring_notes": string | null
   }
 }"""
 
@@ -594,15 +518,50 @@ def clean_json(text: str) -> str:
 def sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
+def normalize_storage_path(path: str) -> str:
+    """
+    Supabase storage.download() requires the object path INSIDE the bucket,
+    not a public/signed URL and not a path prefixed with the bucket name.
+
+    Examples accepted by this helper:
+      - user-id/file.pdf
+      - uploads/user-id/file.pdf
+      - https://.../storage/v1/object/public/uploads/user-id/file.pdf
+      - https://.../storage/v1/object/sign/uploads/user-id/file.pdf?token=...
+    """
+    if not path:
+        return path
+
+    path = str(path).strip()
+
+    markers = [
+        "/storage/v1/object/public/uploads/",
+        "/storage/v1/object/sign/uploads/",
+        "/storage/v1/object/authenticated/uploads/",
+    ]
+    for marker in markers:
+        if marker in path:
+            return path.split(marker, 1)[1].split("?", 1)[0]
+
+    if path.startswith("uploads/"):
+        return path[len("uploads/"):]
+
+    return path
+
 # ── Request model ─────────────────────────────────────────────────────────────
 
 class PipelineIntel(BaseModel):
-    approved_das: Optional[int] = None
-    lodged_applications: Optional[int] = None
-    permit_sites: Optional[int] = None
+    # Accept both frontend camelCase and backend snake_case payloads.
+    model_config = ConfigDict(populate_by_name=True)
+
+    approved_das: Optional[int] = Field(default=None, alias="approvedDAs")
+    lodged_applications: Optional[int] = Field(default=None, alias="lodgedApplications")
+    permit_sites: Optional[int] = Field(default=None, alias="permitSites")
     notes: Optional[str] = None
 
 class PipelineRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     # Multi-file (new)
     storagePaths: Optional[list[str]] = None
     filenames:    Optional[list[str]] = None
@@ -614,9 +573,9 @@ class PipelineRequest(BaseModel):
 
     def resolved_paths(self) -> list[str]:
         if self.storagePaths:
-            return self.storagePaths
+            return [normalize_storage_path(p) for p in self.storagePaths]
         if self.storagePath:
-            return [self.storagePath]
+            return [normalize_storage_path(self.storagePath)]
         raise ValueError("No storage path provided")
 
     def resolved_filenames(self) -> list[str]:
@@ -1048,7 +1007,30 @@ async def pipeline(req: PipelineRequest):
 
             for storage_path, filename in zip(storage_paths, all_filenames):
                 fname_lower = filename.lower()
-                file_bytes  = supabase.storage.from_('uploads').download(storage_path)
+                try:
+                    print("[pipeline] downloading file")
+                    print("  bucket: uploads")
+                    print("  storage_path:", storage_path)
+                    print("  filename:", filename)
+
+                    file_bytes = supabase.storage.from_('uploads').download(storage_path)
+
+                except Exception as e:
+                    print("[pipeline] Supabase download failed")
+                    print("  bucket: uploads")
+                    print("  storage_path:", storage_path)
+                    print("  filename:", filename)
+                    print("  error:", repr(e))
+
+                    yield sse_event("error", {
+                        "message": (
+                            "Uploaded file was not found in Supabase Storage. "
+                            f"bucket=uploads path={storage_path}. "
+                            "This usually means the frontend sent a public URL instead of a bucket-relative path, "
+                            "or the file was deleted by a previous pipeline run. Please re-upload and retry."
+                        )
+                    })
+                    return
 
                 # ── ZIP: extract contained files ──────────────────────────
                 if fname_lower.endswith('.zip'):
@@ -1170,84 +1152,6 @@ async def pipeline(req: PipelineRequest):
             extracted      = json.loads(extracted_text)
             centre_name    = extracted.get('centre', {}).get('name') or 'centre'
 
-            # ── Step 2.5: Compute deterministic demand & market context ───────
-            # Python is the authoritative scorer for market_position.
-            # We resolve postcode and licensed places from extracted data,
-            # compute EDR + market score, then inject into extracted before
-            # passing to the LLM. LLM explains; it doesn't generate.
-            try:
-                _postcode = (
-                    extracted.get("centre", {}).get("postcode")
-                    or extracted.get("key_ratios", {}).get("postcode")
-                    or ""
-                )
-                _postcode = str(_postcode).strip().zfill(4) if _postcode else ""
-
-                _licensed_places = (
-                    extracted.get("centre", {}).get("licensed_places")
-                    or extracted.get("key_ratios", {}).get("licensed_places")
-                    or 0
-                )
-
-                # Pipeline intel: approved DA places
-                _pi = req.pipelineIntel
-                _approved_pipeline_places = 0
-                if _pi and _pi.approved_das:
-                    # Rough estimate: assume average 90 places per approved DA
-                    _approved_pipeline_places = _pi.approved_das * 90
-
-                # Count competitors from pipeline_mentions as proxy when no explicit intel
-                _competitor_count = 0  # will be refined by LLM narrative
-
-                if _postcode:
-                    _subject_places = _licensed_places or 60
-
-                    # Query Supabase for real ACECQA licensed places in this postcode.
-                    # This is the same data source as the map-data route, so EDR is consistent.
-                    _total_catchment_places = _subject_places  # fallback
-                    try:
-                        _acecqa_resp = supabase.from_("acecqa_centres") \
-                            .select("licensed_places") \
-                            .eq("postcode", _postcode) \
-                            .execute()
-                        _acecqa_rows = _acecqa_resp.data or []
-                        _acecqa_total = sum(
-                            (r.get("licensed_places") or 0) for r in _acecqa_rows
-                        )
-                        if _acecqa_total > 0:
-                            # Add subject places if not already in ACECQA (e.g. new centre)
-                            _total_catchment_places = _acecqa_total + _subject_places
-                            _competitor_count = max(len(_acecqa_rows) - 1, 0)
-                        else:
-                            # Fallback: market share heuristic
-                            _pc_int_tmp = int(_postcode) if _postcode.isdigit() else 3000
-                            _is_reg = POSTCODE_AREA_KM2.get(_postcode, 50) > 200
-                            _share = 0.25 if _is_reg else 0.12
-                            _total_catchment_places = round(_subject_places / _share)
-                            _pipeline_mentions = extracted.get("pipeline_mentions", []) or []
-                            _competitor_count = max(len(_pipeline_mentions), 0)
-                    except Exception as _sq_err:
-                        print(f"[demand_service] Supabase ACECQA query failed (non-fatal): {_sq_err}")
-                        _pipeline_mentions = extracted.get("pipeline_mentions", []) or []
-                        _competitor_count = max(len(_pipeline_mentions), 0)
-
-                    _demand_ctx = compute_demand(_postcode, _total_catchment_places)
-                    _market_ctx = market_position_score(
-                        demand_context=_demand_ctx,
-                        competitor_count=_competitor_count,
-                        approved_pipeline_places=_approved_pipeline_places,
-                        subject_licensed_places=_subject_places,
-                    )
-                    extracted["_demand_context"] = _demand_ctx
-                    extracted["_market_context"] = _market_ctx
-                else:
-                    extracted["_demand_context"] = None
-                    extracted["_market_context"] = None
-            except Exception as _de:
-                print(f"[demand_service] error (non-fatal): {_de}")
-                extracted["_demand_context"] = None
-                extracted["_market_context"] = None
-
             # ── Step 3: Score ─────────────────────────────────────────────
             yield sse_event("progress", {
                 "step": 3, "total": 5,
@@ -1288,17 +1192,8 @@ async def pipeline(req: PipelineRequest):
                         "if addbacks are present and confidence is 'high' or 'medium'. "
                         "Always state in the dimension summary whether you used reported or normalised EBITDA "
                         "and why.\n\n"
-                        "DEMAND DATA (use for occupancy_demand external score, ignore any IM demand figures):\n"
-                        + (
-                            f"  EDR (adj kids/place): {extracted['_demand_context']['adj_kids_per_place']['mid']}\n"
-                            f"  Zone: {extracted['_demand_context']['zone']}\n"
-                            f"  Confidence: {extracted['_demand_context']['confidence']}\n"
-                            f"  ABS hit: {extracted['_demand_context']['abs_hit']}\n"
-                            f"  Demand trend: {extracted['_demand_context']['demand_trend']}\n"
-                            if extracted.get('_demand_context') else "  No ABS demand data available.\n"
-                        )
-                        + f"\nEXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
-                        + f"{pipeline_intel_context}"
+                        f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}"
+                        f"{pipeline_intel_context}"
                     )
                 }]
             )
@@ -1313,10 +1208,10 @@ async def pipeline(req: PipelineRequest):
                 'staffing_resilience':     0.08,
                 'lease_economics':         0.08,
                 'valuation_structure':     0.08,
-                'market_position':         0.10,  # increased from 0.07 — demand structure is load-bearing
+                'market_position':         0.07,
                 'management_systems':      0.04,  # was 0.06; reduced to fund ccs_risk increase
                 'regulatory_quality':      0.05,
-                'upside_levers':           0.00,  # zeroed to fund market_position increase (0.07→0.10)
+                'upside_levers':           0.03,  # was 0.05; reduced to fund ccs_risk increase
                 'ccs_risk':                0.07,  # was 0.03; increased — CCS risk is systemic
                 'lease_tail':              0.03,
                 'capex_liability':         0.02,
@@ -1338,17 +1233,10 @@ async def pipeline(req: PipelineRequest):
             if weight_used > 0:
                 # weighted_sum is in 0-10 range; scale to 0-100
                 scored['total_score'] = round((weighted_sum / weight_used) * 10, 1)
-            scored['scoring_version']  = '2.4'
+            scored['scoring_version']  = '2.2'
             scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
             if req.pipelineIntel:
                 scored['pipeline_intel_used'] = True
-            # Attach deterministic demand context to scored output
-            # Frontend can surface EDR + zone alongside the score
-            if extracted.get('_demand_context'):
-                scored['effective_demand_ratio'] = extracted['_demand_context']['adj_kids_per_place']['mid']
-                scored['demand_zone'] = extracted['_demand_context']['zone']
-                scored['demand_context'] = extracted['_demand_context']
-                scored['market_context'] = extracted.get('_market_context')
 
             # ── Step 4: Clean up ALL uploaded paths ───────────────────────
             yield sse_event("progress", {
@@ -1357,10 +1245,14 @@ async def pipeline(req: PipelineRequest):
                 "detail": "Mapping competitors · Building analysis"
             })
 
-            try:
-                supabase.storage.from_('uploads').remove(storage_paths)
-            except Exception:
-                pass
+            # DEBUG/SAFETY: Do not delete uploads during the request.
+            # Deleting here can cause HTTP 404 if the frontend retries, reconnects,
+            # or double-submits the same storagePath before it receives the complete event.
+            # Move cleanup to a scheduled job once the pipeline is stable.
+            # try:
+            #     supabase.storage.from_('uploads').remove(storage_paths)
+            # except Exception:
+            #     pass
 
             # ── Step 5: Complete ──────────────────────────────────────────
             yield sse_event("progress", {
