@@ -895,3 +895,146 @@ def market_position_score(
         "risk_bucket": risk_bucket,
         "confidence": confidence,
     }
+
+
+def build_market_audit(
+    demand_context: dict | None,
+    market_context: dict | None,
+    *,
+    subject_licensed_places: int | None = None,
+    competitor_source: str | None = None,
+    included_centres: int | None = None,
+    pipeline_source: str | None = None,
+    pipeline_searched: bool = False,
+    pipeline_audit: dict | None = None,
+    vendor_kids_0_4: int | None = None,
+    competitor_supply: dict | None = None,
+) -> dict:
+    """
+    Investor-facing audit trail for the deterministic market model.
+
+    This intentionally does not change scoring. It documents the assumptions and
+    weak-data conditions behind the existing demand and market context.
+    """
+    warnings: list[str] = []
+    demand_context = demand_context or {}
+    market_context = market_context or {}
+    detail = demand_context.get("detail") or {}
+
+    radius = demand_context.get("radius_km")
+    is_regional = bool(demand_context.get("is_regional"))
+    abs_hit = bool(demand_context.get("abs_hit"))
+    confidence = demand_context.get("confidence") or "low"
+    kids = demand_context.get("estimated_kids_0_to_4")
+    total_places = demand_context.get("total_licensed_places")
+    competitor_count = market_context.get("competitor_count")
+    pipeline_places = market_context.get("approved_pipeline_places")
+    pipeline_audit = pipeline_audit or {}
+    competitor_supply = competitor_supply or None
+    edr = market_context.get("edr_mid") or (demand_context.get("adj_kids_per_place") or {}).get("mid")
+
+    if radius:
+        if is_regional:
+            radius_reason = "Regional postcode or large postcode area; wider catchment radius used."
+        elif detail.get("postcode_area_km2") and detail.get("postcode_area_km2") <= 20:
+            radius_reason = "Dense metro postcode; 2km catchment radius used."
+        else:
+            radius_reason = "Metro/suburban postcode; standard catchment radius used."
+    else:
+        radius_reason = "Catchment radius unavailable."
+
+    kids_source = (
+        "ABS 2021 postcode age bands grown forward using internal postcode growth factor"
+        if abs_hit
+        else "Fallback postcode-band estimate; ABS postcode allocation not directly available"
+    )
+    if not abs_hit:
+        warnings.append("EDR uses approximated postcode allocation because ABS postcode data was not directly available.")
+
+    coverage_pct = detail.get("coverage_pct")
+    if abs_hit and isinstance(coverage_pct, (int, float)) and coverage_pct < 70:
+        warnings.append(f"ABS catchment fill coverage is {coverage_pct}%, so demand confidence should be treated as medium.")
+
+    if vendor_kids_0_4 and kids:
+        delta = abs(vendor_kids_0_4 - kids)
+        pct_delta = delta / max(kids, 1)
+        if pct_delta >= 0.25:
+            warnings.append(
+                f"Vendor supplied kids 0-4 count ({vendor_kids_0_4}) differs materially from internal catchment estimate ({kids})."
+            )
+
+    if pipeline_audit.get("warnings"):
+        warnings.extend(pipeline_audit.get("warnings") or [])
+    elif pipeline_places in (None, 0) and not pipeline_searched:
+        warnings.append("Pipeline places are zero because no DA/pipeline source was provided or searched.")
+
+    if competitor_count in (None, 0):
+        warnings.append("Competitor list is empty or likely incomplete; ACECQA/manual competitor coverage should be verified.")
+
+    if competitor_supply:
+        warnings.extend(competitor_supply.get("warnings") or [])
+        if competitor_supply.get("material_difference"):
+            warnings.append("Geospatial competitor supply differs materially from postcode fallback; verify catchment methodology.")
+        if competitor_supply.get("scoring_source") != competitor_supply.get("source"):
+            warnings.append("Market score retained postcode fallback because geospatial competitor confidence was not high enough.")
+
+    if confidence == "high":
+        if not abs_hit or not competitor_source or (pipeline_places in (None, 0) and not pipeline_searched):
+            warnings.append("Demand confidence is high despite one or more missing or approximated market inputs.")
+
+    if edr is None:
+        interpretation = "unknown"
+    elif edr >= 1.0:
+        interpretation = "undersupplied"
+    elif edr >= 0.5:
+        interpretation = "balanced"
+    else:
+        interpretation = "oversupplied"
+
+    pipeline_confidence = (
+        pipeline_audit.get("confidence")
+        or ("high" if pipeline_searched else ("medium" if pipeline_source else "low"))
+    )
+
+    audit = {
+        "catchment_radius_km": radius,
+        "radius_reason": radius_reason,
+        "kids_0_4": {
+            "value": kids,
+            "source": kids_source,
+            "year": detail.get("year_estimate") or 2021,
+            "confidence": confidence if abs_hit else "low",
+        },
+        "ldc_utilisation_rate": {
+            "value": (demand_context.get("ldc_util_rate") or {}).get("mid"),
+            "source": "DoE CCS Quarterly Report March 2024 utilisation bands",
+            "rationale": "Uses metro/regional LDC utilisation midpoint to convert children aged 0-4 into likely long-day-care demand.",
+        },
+        "licensed_places": {
+            "value": total_places,
+            "source": competitor_source or "Subject licensed places fallback / manual estimate",
+            "included_centres": included_centres,
+        },
+        "competitor_count": {
+            "value": competitor_count,
+            "source": competitor_source or "Not verified",
+        },
+        "pipeline_places": {
+            "value": pipeline_places or 0,
+            "source": pipeline_source or ("No DA/pipeline source provided" if not pipeline_audit else pipeline_audit.get("source_type")),
+            "confidence": pipeline_confidence,
+            "approved_places": pipeline_audit.get("approved_places"),
+            "lodged_places": pipeline_audit.get("lodged_places"),
+            "risk_adjusted_places": pipeline_audit.get("risk_adjusted_places"),
+            "search_required": pipeline_audit.get("search_required"),
+        },
+        "edr": {
+            "value": edr,
+            "formula": "estimated kids aged 0-4 × LDC utilisation midpoint ÷ licensed places in catchment",
+            "interpretation": interpretation,
+        },
+        "warnings": warnings,
+    }
+    if competitor_supply:
+        audit["competitor_supply"] = competitor_supply
+    return audit

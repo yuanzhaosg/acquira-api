@@ -1,7 +1,7 @@
-import os, json, re, base64, tempfile, shutil
+import os, json, re, base64, tempfile, shutil, copy, uuid, mimetypes, logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -13,9 +13,16 @@ import openpyxl
 import zipfile
 import docx as python_docx   # python-docx
 import xlrd                   # legacy .xls support
+from demand_service import compute_demand, market_position_score, build_market_audit, POSTCODE_AREA_KM2
+from geospatial_competitors import get_nearby_competitors, material_supply_difference
+from pipeline_supply import build_pipeline_supply
+from run_diff import build_run_diff
+from structured_deal import build_structured_deal_intelligence
 from supabase import create_client
 
 app = FastAPI()
+logger = logging.getLogger("acquira-api")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -390,10 +397,10 @@ def extract_pdf_text(pdf_path: str) -> str:
     try:
         text = ''
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
+            for idx, page in enumerate(pdf.pages, start=1):
                 t = page.extract_text()
                 if t:
-                    text += t + '\n'
+                    text += f'\n--- Page {idx} ---\n{t}\n'
         return text[:80000]
     except Exception:
         return ''
@@ -423,7 +430,7 @@ async def extract_scanned_pdf_text(pdf_path: str, purpose: str) -> str:
 
         content = [
             *[{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}} for img in images],
-            {"type": "text", "text": f"Extract all text content from these document pages. This is a {purpose}. Return plain text only, preserving structure and numbers accurately."}
+            {"type": "text", "text": f"Extract all text content from these document pages. This is a {purpose}. Return plain text only, preserving structure and numbers accurately. Prefix each page in order with a marker like --- Page 1 ---, --- Page 2 ---, etc."}
         ]
 
         response = client.messages.create(
@@ -559,6 +566,19 @@ class PipelineIntel(BaseModel):
     permit_sites: Optional[int] = Field(default=None, alias="permitSites")
     notes: Optional[str] = None
 
+class PipelineProject(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    address: Optional[str] = None
+    distance_km: Optional[float] = None
+    status: str = "unknown"
+    proposed_places: Optional[Any] = None
+    source_url: Optional[str] = None
+    source_file: Optional[str] = None
+    source_date: Optional[str] = None
+    confidence: Optional[str] = None
+    notes: Optional[str] = None
+
 class PipelineRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -570,6 +590,7 @@ class PipelineRequest(BaseModel):
     filename:     Optional[str]       = None
     # Pipeline intelligence (optional)
     pipelineIntel: Optional[PipelineIntel] = None
+    pipelineProjects: Optional[list[PipelineProject]] = None
 
     def resolved_paths(self) -> list[str]:
         if self.storagePaths:
@@ -585,11 +606,743 @@ class PipelineRequest(BaseModel):
             return [self.filename]
         return [p.split('/')[-1] for p in self.resolved_paths()]
 
+class ReunderwriteBase(BaseModel):
+    extracted: dict[str, Any]
+    scored: dict[str, Any]
+    workflow: dict[str, Any]
+
+class SelectedDiligenceDocument(BaseModel):
+    id: str
+    storage_path: str
+    filename: str
+    document_type: Optional[str] = None
+    source_item_id: Optional[str] = None
+    file_size: Optional[int] = None
+
+class SelectedSourceDocument(BaseModel):
+    id: str
+    storage_path: str
+    filename: str
+    content_type: Optional[str] = None
+    source_kind: Optional[str] = None
+    run_id: Optional[str] = None
+    file_size: Optional[int] = None
+
+class ReunderwriteRequest(BaseModel):
+    deal_id: str
+    run_id: str
+    base_run_id: str
+    base: ReunderwriteBase
+    selected_diligence_documents: Optional[list[SelectedDiligenceDocument]] = None
+    selected_source_documents: Optional[list[SelectedSourceDocument]] = None
+    input_document_count: Optional[int] = None
+    input_total_bytes: Optional[int] = None
+    pipeline_projects: Optional[list[PipelineProject]] = None
+    mode: str = "reunderwrite"
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+REUNDERWRITE_TEXT_BUDGET: dict[str, tuple[int, int]] = {
+    'im_pdf':               (20000, 3),
+    'im_docx':              (20000, 3),
+    'pl_excel':             (12000, 10),
+    'occupancy_excel':      (12000, 10),
+    'transaction_excel':    (8000,  5),
+    'payroll_excel':        (12000, 10),
+    'lease_pdf':            (10000, 5),
+    'lease_docx':           (10000, 5),
+    'service_approval_pdf': (5000,  3),
+    'nqs_pdf':              (5000,  3),
+}
+CLAUDE_CHAR_LIMIT = 120_000
+MAX_REUNDERWRITE_DOCUMENTS = 10
+MAX_REUNDERWRITE_DECLARED_BYTES = 75 * 1024 * 1024
+DIMENSION_WEIGHTS = {
+    'occupancy_demand':        0.15,
+    'profitability_cashflow':  0.15,
+    'revenue_pricing':         0.08,
+    'staffing_resilience':     0.08,
+    'lease_economics':         0.08,
+    'valuation_structure':     0.08,
+    'market_position':         0.10,
+    'management_systems':      0.04,
+    'regulatory_quality':      0.05,
+    'upside_levers':           0.00,
+    'ccs_risk':                0.07,
+    'lease_tail':              0.03,
+    'capex_liability':         0.02,
+    'staff_qualification_mix': 0.02,
+    'fee_benchmarking':        0.02,
+    'operator_quality':        0.02,
+    'enrolment_trend':         0.01,
+}
+
+def _is_present(value: Any) -> bool:
+    return value is not None and value != "" and value != [] and value != {}
+
+def validate_diligence_storage_path(storage_path: str, deal_id: str) -> None:
+    prefix = f"diligence/{deal_id}/"
+    if not storage_path.startswith(prefix):
+        raise ValueError("storage_path must be under diligence/{deal_id}/")
+    remainder = storage_path[len(prefix):]
+    if not remainder:
+        raise ValueError("storage_path filename segment is required")
+    if ".." in remainder or "\\" in remainder:
+        raise ValueError("storage_path contains an unsafe segment")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in remainder):
+        raise ValueError("storage_path contains control characters")
+    if any(part == "" for part in remainder.split("/")):
+        raise ValueError("storage_path contains empty path segments")
+
+def validate_source_storage_path(storage_path: str) -> None:
+    prefix = "deal-sources/"
+    if not storage_path.startswith(prefix):
+        raise ValueError("selected source storage_path must be under deal-sources/")
+    remainder = storage_path[len(prefix):]
+    if not remainder:
+        raise ValueError("selected source storage_path requires a filename segment")
+    if ".." in remainder or "\\" in remainder:
+        raise ValueError("selected source storage_path contains an unsafe segment")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in remainder):
+        raise ValueError("selected source storage_path contains control characters")
+    if any(part == "" for part in remainder.split("/")):
+        raise ValueError("selected source storage_path contains empty path segments")
+
+def _safe_local_name(name: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9._-]', '_', Path(name).name or "diligence_document")
+
+def _safe_storage_name(name: str, fallback: str = "source_document") -> str:
+    safe = re.sub(r'[^a-zA-Z0-9._-]', '_', Path(name).name or fallback).strip("._")
+    return safe[:180] or fallback
+
+def validate_pipeline_temp_path(storage_path: str) -> None:
+    if not storage_path.startswith("pipeline/"):
+        raise ValueError("Initial pipeline source storage paths must be under pipeline/")
+    remainder = storage_path[len("pipeline/"):]
+    if not remainder:
+        raise ValueError("Pipeline source storage path filename segment is required")
+    if ".." in remainder or "\\" in remainder:
+        raise ValueError("Pipeline source storage path contains an unsafe segment")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in remainder):
+        raise ValueError("Pipeline source storage path contains control characters")
+    if any(part == "" for part in remainder.split("/")):
+        raise ValueError("Pipeline source storage path contains empty path segments")
+
+def retain_pipeline_source_file(
+    *,
+    pipeline_request_id: str,
+    index: int,
+    original_storage_path: str,
+    filename: str,
+    file_bytes: bytes,
+) -> dict[str, Any]:
+    validate_pipeline_temp_path(original_storage_path)
+    safe_filename = _safe_storage_name(filename, f"source_{index + 1}")
+    retained_storage_path = f"deal-sources/pending/{pipeline_request_id}/{index + 1}-{safe_filename}"
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    supabase.storage.from_("uploads").upload(
+        retained_storage_path,
+        file_bytes,
+        {"content-type": content_type, "upsert": False},
+    )
+    return {
+        "original_storage_path": original_storage_path,
+        "retained_storage_path": retained_storage_path,
+        "filename": filename,
+        "content_type": content_type,
+        "file_size": len(file_bytes),
+    }
+
+async def parse_diligence_documents(
+    docs: list[SelectedDiligenceDocument],
+    *,
+    deal_id: str,
+    work_dir: str,
+) -> tuple[str, list[str], dict[str, str], list[str]]:
+    combined_text = ""
+    source_files: list[str] = []
+    file_classes: dict[str, str] = {}
+    skipped: list[str] = []
+    class_counts: dict[str, int] = {}
+
+    for index, doc in enumerate(docs):
+        validate_diligence_storage_path(doc.storage_path, deal_id)
+        if not doc.id or not doc.filename:
+            raise ValueError("Each selected diligence document requires id and filename")
+        file_bytes = supabase.storage.from_('uploads').download(doc.storage_path)
+        filename = doc.filename
+        fname_lower = filename.lower()
+        doc_label = f"{filename} [diligence:{doc.id}]"
+
+        def add_text(base_name: str, file_class: str, text: str, label: str) -> None:
+            nonlocal combined_text
+            if not text:
+                skipped.append(label)
+                return
+            max_chars, _max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (6000, 3))
+            source_files.append(label)
+            file_classes[label] = file_class
+            combined_text += (
+                f"\n\n=== {label} ({file_class}) ===\n"
+                "DOCUMENT_ROLE: Diligence document\n"
+                f"DILIGENCE_DOCUMENT_ID: {doc.id}\n"
+                f"STORAGE_PATH: {doc.storage_path}\n"
+                f"SOURCE_ITEM_ID: {doc.source_item_id or 'none'}\n"
+                f"DOCUMENT_TYPE: {doc.document_type or 'unknown'}\n\n"
+                f"{text[:max_chars]}"
+            )
+
+        if fname_lower.endswith(".zip"):
+            zip_path = os.path.join(work_dir, f"{index}_diligence.zip")
+            with open(zip_path, "wb") as f:
+                f.write(file_bytes)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for entry_name in zf.namelist():
+                    base_name = Path(entry_name).name
+                    if not base_name or base_name.startswith("."):
+                        continue
+                    file_class = classify_file(base_name)
+                    if file_class == "unknown":
+                        skipped.append(base_name)
+                        continue
+                    _max_chars, max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (6000, 3))
+                    if class_counts.get(file_class, 0) >= max_count:
+                        skipped.append(base_name)
+                        continue
+                    entry_path = os.path.join(work_dir, f"{index}_{_safe_local_name(base_name)}")
+                    with open(entry_path, "wb") as f:
+                        f.write(zf.read(entry_name))
+                    text = _extract_file_text(entry_path, base_name)
+                    if base_name.lower().endswith(".pdf") and is_pdf_scanned(text):
+                        text = await extract_scanned_pdf_text(entry_path, file_class.replace("_", " "))
+                    class_counts[file_class] = class_counts.get(file_class, 0) + 1
+                    add_text(base_name, file_class, text, f"{base_name} [diligence:{doc.id}]")
+            continue
+
+        file_class = classify_file(filename)
+        if file_class == "unknown":
+            skipped.append(filename)
+            continue
+        _max_chars, max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (10000, 3))
+        if class_counts.get(file_class, 0) >= max_count:
+            skipped.append(filename)
+            continue
+        file_path = os.path.join(work_dir, f"{index}_{_safe_local_name(filename)}")
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+        text = _extract_file_text(file_path, filename)
+        if fname_lower.endswith(".pdf") and is_pdf_scanned(text):
+            text = await extract_scanned_pdf_text(file_path, file_class.replace("_", " "))
+        class_counts[file_class] = class_counts.get(file_class, 0) + 1
+        add_text(filename, file_class, text, doc_label)
+
+    return combined_text, source_files, file_classes, skipped
+
+async def parse_source_documents(
+    docs: list[SelectedSourceDocument],
+    *,
+    work_dir: str,
+) -> tuple[str, list[str], dict[str, str], list[str]]:
+    combined_text = ""
+    source_files: list[str] = []
+    file_classes: dict[str, str] = {}
+    skipped: list[str] = []
+    class_counts: dict[str, int] = {}
+
+    for index, doc in enumerate(docs):
+        validate_source_storage_path(doc.storage_path)
+        if not doc.id or not doc.filename:
+            raise ValueError("Each selected source document requires id and filename")
+        file_bytes = supabase.storage.from_('uploads').download(doc.storage_path)
+        filename = doc.filename
+        fname_lower = filename.lower()
+        doc_label = f"{filename} [retained_source:{doc.id}]"
+
+        def add_text(file_class: str, text: str, label: str) -> None:
+            nonlocal combined_text
+            if not text:
+                skipped.append(label)
+                return
+            max_chars, _max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (10000, 3))
+            source_files.append(label)
+            file_classes[label] = file_class
+            combined_text += (
+                f"\n\n=== {label} ({file_class}) ===\n"
+                "DOCUMENT_ROLE: Retained original source document\n"
+                f"SOURCE_DOCUMENT_ID: {doc.id}\n"
+                f"STORAGE_PATH: {doc.storage_path}\n"
+                f"ORIGINAL_RUN_ID: {doc.run_id or 'none'}\n"
+                f"SOURCE_KIND: {doc.source_kind or 'unknown'}\n"
+                f"CONTENT_TYPE: {doc.content_type or 'unknown'}\n\n"
+                f"{text[:max_chars]}"
+            )
+
+        if fname_lower.endswith(".zip"):
+            zip_path = os.path.join(work_dir, f"{index}_source.zip")
+            with open(zip_path, "wb") as f:
+                f.write(file_bytes)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for entry_name in zf.namelist():
+                    base_name = Path(entry_name).name
+                    if not base_name or base_name.startswith("."):
+                        continue
+                    file_class = classify_file(base_name)
+                    if file_class == "unknown":
+                        skipped.append(base_name)
+                        continue
+                    _max_chars, max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (10000, 3))
+                    if class_counts.get(file_class, 0) >= max_count:
+                        skipped.append(base_name)
+                        continue
+                    entry_path = os.path.join(work_dir, f"{index}_source_{_safe_local_name(base_name)}")
+                    with open(entry_path, "wb") as f:
+                        f.write(zf.read(entry_name))
+                    text = _extract_file_text(entry_path, base_name)
+                    if base_name.lower().endswith(".pdf") and is_pdf_scanned(text):
+                        text = await extract_scanned_pdf_text(entry_path, file_class.replace("_", " "))
+                    class_counts[file_class] = class_counts.get(file_class, 0) + 1
+                    add_text(file_class, text, f"{base_name} [retained_source:{doc.id}]")
+            continue
+
+        file_class = classify_file(filename)
+        if file_class == "unknown":
+            skipped.append(filename)
+            continue
+        _max_chars, max_count = REUNDERWRITE_TEXT_BUDGET.get(file_class, (10000, 3))
+        if class_counts.get(file_class, 0) >= max_count:
+            skipped.append(filename)
+            continue
+        file_path = os.path.join(work_dir, f"{index}_source_{_safe_local_name(filename)}")
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+        text = _extract_file_text(file_path, filename)
+        if fname_lower.endswith(".pdf") and is_pdf_scanned(text):
+            text = await extract_scanned_pdf_text(file_path, file_class.replace("_", " "))
+        class_counts[file_class] = class_counts.get(file_class, 0) + 1
+        add_text(file_class, text, doc_label)
+
+    return combined_text, source_files, file_classes, skipped
+
+def _merge_present_values(
+    base: Any,
+    updates: Any,
+    *,
+    path: str = "",
+    changed_paths: set[str],
+    conflicts: list[dict[str, Any]],
+) -> Any:
+    if isinstance(base, dict) and isinstance(updates, dict):
+        merged = copy.deepcopy(base)
+        for key, value in updates.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key.startswith("_") and not _is_present(value):
+                continue
+            merged[key] = _merge_present_values(
+                merged.get(key),
+                value,
+                path=child_path,
+                changed_paths=changed_paths,
+                conflicts=conflicts,
+            )
+        return merged
+    if not _is_present(updates):
+        return copy.deepcopy(base)
+    if base != updates:
+        changed_paths.add(path)
+        if _is_present(base):
+            conflicts.append({"path": path, "old_value": base, "new_value": updates})
+    return copy.deepcopy(updates)
+
+def _changed_top_level_fields(changed_paths: set[str]) -> set[str]:
+    mapping = {
+        "financials.fy25.revenue": "revenue",
+        "financials.fy25.ebitda": "ebitda",
+        "financials.fy25.total_labour_cost": "payroll_labour_cost",
+        "financials.asking_price": "asking_price",
+        "centre.licensed_places": "licensed_places",
+        "occupancy.current_month_pct": "current_occupancy_pct",
+        "occupancy.latest_week_pct": "latest_week_occupancy_pct",
+        "occupancy.avg_4wk_pct": "avg_4wk_occupancy_pct",
+        "occupancy.avg_13wk_pct": "avg_13wk_occupancy_pct",
+        "occupancy.avg_52wk_pct": "avg_52wk_occupancy_pct",
+        "financials.fy25.rent_pa": "rent_pa",
+    }
+    changed: set[str] = set()
+    for path, field in mapping.items():
+        if any(candidate == path or candidate.startswith(f"{path}.") for candidate in changed_paths):
+            changed.add(field)
+    return changed
+
+def annotate_base_snapshot_facts(workflow: dict[str, Any], changed_fields: set[str], run_id: str) -> None:
+    base_label = "Base run snapshot (not re-verified by selected diligence documents)"
+    for key in ("facts", "extracted_facts"):
+        facts = workflow.get(key)
+        if not isinstance(facts, list):
+            continue
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            field = str(fact.get("field") or "")
+            source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+            if field not in changed_fields and not source.get("excerpt"):
+                source["label"] = base_label
+                source["file"] = base_label
+                source["run_id"] = run_id
+                fact["source"] = source
+                fact["source_label"] = base_label
+                fact["status"] = fact.get("status") or "needs_review"
+    evidence = workflow.get("evidence")
+    if isinstance(evidence, list):
+        fact_fields = {
+            str(f.get("evidence_id")): str(f.get("field") or "")
+            for f in workflow.get("facts", []) if isinstance(f, dict)
+        }
+        for ev in evidence:
+            if not isinstance(ev, dict):
+                continue
+            field = str(ev.get("field") or fact_fields.get(str(ev.get("id"))) or "")
+            source = ev.get("source") if isinstance(ev.get("source"), dict) else {}
+            if field not in changed_fields and not source.get("excerpt"):
+                source["label"] = base_label
+                source["file"] = base_label
+                source["run_id"] = run_id
+                ev["source"] = source
+                ev["source_label"] = base_label
+            else:
+                source["run_id"] = run_id
+                ev["source"] = source
+
+def annotate_run_evidence_metadata(workflow: dict[str, Any], run_id: str) -> None:
+    def scoped(local_id: Any) -> str | None:
+        if not local_id:
+            return None
+        local = str(local_id)
+        return local if ":" in local else f"{run_id}:{local}"
+
+    for ev in workflow.get("evidence", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        local_id = str(ev.get("local_evidence_id") or ev.get("id") or "")
+        if not local_id:
+            continue
+        ev["local_evidence_id"] = local_id
+        ev["run_id"] = run_id
+        ev["run_evidence_id"] = scoped(local_id)
+        source = ev.get("source") if isinstance(ev.get("source"), dict) else {}
+        source["local_evidence_id"] = local_id
+        source["run_id"] = run_id
+        source["run_evidence_id"] = scoped(local_id)
+        ev["source"] = source
+
+    for key in ("facts", "extracted_facts"):
+        for fact in workflow.get(key, []) or []:
+            if not isinstance(fact, dict):
+                continue
+            local_id = str(fact.get("local_evidence_id") or fact.get("evidence_id") or "")
+            if not local_id:
+                continue
+            fact["local_evidence_id"] = local_id
+            fact["run_id"] = run_id
+            fact["run_evidence_id"] = scoped(local_id)
+            source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+            source["local_evidence_id"] = local_id
+            source["run_id"] = run_id
+            source["run_evidence_id"] = scoped(local_id)
+            fact["source"] = source
+
+def recalculate_total_score(scored: dict[str, Any]) -> None:
+    dims = scored.get("dimensions", {})
+    weighted_sum = 0.0
+    weight_used = 0.0
+    for dim_id, weight in DIMENSION_WEIGHTS.items():
+        dim = dims.get(dim_id, {}) if isinstance(dims, dict) else {}
+        raw = dim.get("score") if isinstance(dim, dict) else None
+        if isinstance(raw, (int, float)) and 0 <= raw <= 10:
+            weighted_sum += raw * weight
+            weight_used += weight
+    if weight_used > 0:
+        scored["total_score"] = round((weighted_sum / weight_used) * 10, 1)
+
+def reunderwrite_error(category: str, detail: str, status_code: int = 500) -> JSONResponse:
+    return JSONResponse({"detail": detail, "error_category": category}, status_code=status_code)
+
+def declared_total_bytes(req: ReunderwriteRequest) -> int:
+    if isinstance(req.input_total_bytes, int) and req.input_total_bytes > 0:
+        return req.input_total_bytes
+    total = 0
+    for doc in (req.selected_diligence_documents or []):
+        if isinstance(doc.file_size, int) and doc.file_size > 0:
+            total += doc.file_size
+    for doc in (req.selected_source_documents or []):
+        if isinstance(doc.file_size, int) and doc.file_size > 0:
+            total += doc.file_size
+    return total
+
+@app.post("/pipeline/reunderwrite")
+async def pipeline_reunderwrite(req: ReunderwriteRequest):
+    work_dir = tempfile.mkdtemp(prefix="acquira-reunderwrite-")
+    try:
+        logger.info("reunderwrite.start run_id=%s deal_id=%s", req.run_id, req.deal_id)
+        if req.mode != "reunderwrite":
+            return reunderwrite_error("invalid_input", "mode must be reunderwrite", 400)
+        if not req.deal_id or not req.run_id or not req.base_run_id:
+            return reunderwrite_error("invalid_input", "deal_id, run_id, and base_run_id are required", 400)
+        selected_diligence_documents = req.selected_diligence_documents or []
+        selected_source_documents = req.selected_source_documents or []
+        if not selected_diligence_documents and not selected_source_documents:
+            return reunderwrite_error("invalid_input", "At least one selected diligence or source document is required", 400)
+        total_docs = len(selected_diligence_documents) + len(selected_source_documents)
+        total_bytes = declared_total_bytes(req)
+        logger.info(
+            "reunderwrite.inputs run_id=%s deal_id=%s source_docs=%s diligence_docs=%s declared_bytes=%s",
+            req.run_id,
+            req.deal_id,
+            len(selected_source_documents),
+            len(selected_diligence_documents),
+            total_bytes,
+        )
+        if total_docs > MAX_REUNDERWRITE_DOCUMENTS:
+            return reunderwrite_error("invalid_input", f"Select {MAX_REUNDERWRITE_DOCUMENTS} or fewer documents for one re-underwrite run.", 400)
+        if total_bytes > MAX_REUNDERWRITE_DECLARED_BYTES:
+            return reunderwrite_error("invalid_input", "Selected documents are too large for one synchronous re-underwrite run.", 400)
+
+        base_extracted = copy.deepcopy(req.base.extracted)
+        base_scored = copy.deepcopy(req.base.scored)
+        base_workflow = copy.deepcopy(req.base.workflow)
+        if not isinstance(base_extracted, dict) or not isinstance(base_scored, dict) or not isinstance(base_workflow, dict):
+            return reunderwrite_error("invalid_input", "base.extracted, base.scored, and base.workflow must be objects", 400)
+
+        try:
+            source_text, source_source_files, source_file_classes, source_skipped = await parse_source_documents(
+                selected_source_documents,
+                work_dir=work_dir,
+            ) if selected_source_documents else ("", [], {}, [])
+            diligence_text, diligence_source_files, diligence_file_classes, diligence_skipped = await parse_diligence_documents(
+                selected_diligence_documents,
+                deal_id=req.deal_id,
+                work_dir=work_dir,
+            ) if selected_diligence_documents else ("", [], {}, [])
+        except ValueError as e:
+            logger.warning("reunderwrite.parse_invalid run_id=%s deal_id=%s error=%s", req.run_id, req.deal_id, e)
+            return reunderwrite_error("invalid_input", str(e), 400)
+        except Exception as e:
+            logger.exception("reunderwrite.parse_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+            names = [doc.filename for doc in [*selected_source_documents, *selected_diligence_documents] if doc.filename]
+            name_hint = ", ".join(names[:5])
+            suffix = f" while processing {name_hint}" if name_hint else ""
+            return reunderwrite_error("parse_failed", f"Selected document parse failed{suffix}: {e}", 422)
+
+        combined_text = source_text + diligence_text
+        source_files = [*source_source_files, *diligence_source_files]
+        file_classes = {**source_file_classes, **diligence_file_classes}
+        skipped = [*source_skipped, *diligence_skipped]
+        if not combined_text.strip():
+            return reunderwrite_error("parse_failed", "Could not extract text from selected documents.", 422)
+        logger.info(
+            "reunderwrite.parse_complete run_id=%s deal_id=%s parsed_files=%s skipped=%s",
+            req.run_id,
+            req.deal_id,
+            len(source_files),
+            len(skipped),
+        )
+
+        try:
+            extraction_response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                temperature=0,
+                system=EXTRACTION_SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "You are re-underwriting an existing childcare acquisition from selected retained source and diligence evidence.\n"
+                        "Extract ONLY facts directly supported by the selected documents below. "
+                        "Use the base snapshot only as context for entity matching and field names. "
+                        "If a value is not present in the selected documents, return null for that field; "
+                        "do not copy values from the base snapshot.\n\n"
+                        f"BASE SNAPSHOT CONTEXT (not new evidence):\n{json.dumps(base_extracted, indent=2)[:40000]}\n\n"
+                        f"SELECTED EVIDENCE:\n{combined_text[:CLAUDE_CHAR_LIMIT]}"
+                    )
+                }]
+            )
+            extracted_text = clean_json(extraction_response.content[0].text)
+            diligence_extracted = json.loads(extracted_text)
+        except Exception as e:
+            logger.exception("reunderwrite.extraction_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+            return reunderwrite_error("extraction_failed", f"Extraction failed during re-underwrite: {e}", 502)
+        logger.info("reunderwrite.extraction_complete run_id=%s deal_id=%s", req.run_id, req.deal_id)
+
+        changed_paths: set[str] = set()
+        merge_conflicts: list[dict[str, Any]] = []
+        merged_extracted = _merge_present_values(
+            base_extracted,
+            diligence_extracted,
+            changed_paths=changed_paths,
+            conflicts=merge_conflicts,
+        )
+
+        merged_meta = merged_extracted.setdefault("meta", {})
+        if isinstance(merged_meta, dict):
+            merged_meta["reunderwrite_run_id"] = req.run_id
+            merged_meta["base_run_id"] = req.base_run_id
+            merged_meta["reunderwrite_source_type"] = "selected_source_and_diligence_documents"
+            merged_meta["selected_source_document_ids"] = [doc.id for doc in selected_source_documents]
+            merged_meta["selected_diligence_document_ids"] = [doc.id for doc in selected_diligence_documents]
+            merged_meta["selected_source_files"] = source_files
+
+        if req.pipeline_projects is not None:
+            pipeline_supply = build_pipeline_supply(req.pipeline_projects, None)
+            merged_extracted["_pipeline_projects"] = pipeline_supply["pipeline_projects"]
+            merged_extracted["_pipeline_audit"] = pipeline_supply["pipeline_audit"]
+        else:
+            merged_extracted["_pipeline_projects"] = base_workflow.get("pipeline_projects") or base_scored.get("pipeline_projects") or []
+            merged_extracted["_pipeline_audit"] = base_workflow.get("pipeline_audit") or base_scored.get("pipeline_audit")
+
+        # Existing deals do not retain original source documents, so retain base
+        # market context unless a later phase adds source-retention/recomputation.
+        for key in ("_demand_context", "_market_context", "_market_audit"):
+            if not merged_extracted.get(key) and base_extracted.get(key):
+                merged_extracted[key] = copy.deepcopy(base_extracted[key])
+
+        centre_name = merged_extracted.get("centre", {}).get("name") or base_scored.get("centre_name") or "centre"
+        demand_context = merged_extracted.get("_demand_context")
+        demand_block = "  No ABS demand data available.\n"
+        if isinstance(demand_context, dict):
+            demand_block = (
+                f"  EDR (adj kids/place): {demand_context.get('adj_kids_per_place', {}).get('mid')}\n"
+                f"  Zone: {demand_context.get('zone')}\n"
+                f"  Confidence: {demand_context.get('confidence')}\n"
+                f"  ABS hit: {demand_context.get('abs_hit')}\n"
+                f"  Demand trend: {demand_context.get('demand_trend')}\n"
+            )
+
+        pipeline_intel_context = ""
+        if merged_extracted.get("_pipeline_projects"):
+            pipeline_intel_context += "\n\nSTRUCTURED DA / PIPELINE PROJECTS (preserved or provided):\n"
+            for project in (merged_extracted.get("_pipeline_projects") or [])[:10]:
+                pipeline_intel_context += (
+                    f"- {project.get('status', 'unknown')}: "
+                    f"{project.get('name') or project.get('address') or 'Pipeline project'}"
+                    f" · {project.get('proposed_places') or 'unknown'} places"
+                    f" · confidence {project.get('confidence', 'low')}\n"
+                )
+
+        try:
+            scoring_response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                temperature=0,
+                system=SCORING_SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Re-score this childcare centre acquisition using the merged re-underwriting data.\n\n"
+                        "The merged data starts from the prior run and overlays only source-backed values "
+                        "found in selected retained source or diligence documents. Be explicit where underwriting still depends "
+                        "on unresolved evidence. Do not treat waived diligence items as evidence.\n\n"
+                        "DEMAND DATA (use for occupancy_demand external score, ignore any document demand figures):\n"
+                        + demand_block
+                        + f"\nMERGED EXTRACTED DATA:\n{json.dumps(merged_extracted, indent=2)}"
+                        + f"{pipeline_intel_context}"
+                    )
+                }]
+            )
+            scored_text = clean_json(scoring_response.content[0].text)
+            new_scored = json.loads(scored_text)
+        except Exception as e:
+            logger.exception("reunderwrite.scoring_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+            return reunderwrite_error("scoring_failed", f"Scoring failed during re-underwrite: {e}", 502)
+        logger.info("reunderwrite.scoring_complete run_id=%s deal_id=%s", req.run_id, req.deal_id)
+        recalculate_total_score(new_scored)
+        new_scored["scoring_version"] = "2.4-reunderwrite"
+        new_scored["scoring_timestamp"] = datetime.now(timezone.utc).isoformat()
+        new_scored["reunderwrite_run_id"] = req.run_id
+        new_scored["base_run_id"] = req.base_run_id
+        new_scored["pipeline_projects"] = merged_extracted.get("_pipeline_projects") or []
+        new_scored["pipeline_audit"] = merged_extracted.get("_pipeline_audit")
+        if merged_extracted.get("_demand_context"):
+            new_scored["effective_demand_ratio"] = merged_extracted["_demand_context"].get("adj_kids_per_place", {}).get("mid")
+            new_scored["demand_zone"] = merged_extracted["_demand_context"].get("zone")
+            new_scored["demand_context"] = merged_extracted["_demand_context"]
+            new_scored["market_context"] = merged_extracted.get("_market_context")
+            new_scored["market_audit"] = merged_extracted.get("_market_audit")
+
+        try:
+            structured_intel = build_structured_deal_intelligence(
+                extracted=merged_extracted,
+                scored=new_scored,
+                combined_text=combined_text,
+                source_files=source_files,
+                file_classes=file_classes,
+            )
+        except Exception as e:
+            logger.exception("reunderwrite.workflow_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+            return reunderwrite_error("workflow_build_failed", f"Workflow build failed during re-underwrite: {e}", 500)
+        structured_intel["run_id"] = req.run_id
+        structured_intel["base_run_id"] = req.base_run_id
+        structured_intel["reunderwrite_source"] = {
+            "mode": "selected_source_and_diligence_documents",
+            "source_document_ids": [doc.id for doc in selected_source_documents],
+            "diligence_document_ids": [doc.id for doc in selected_diligence_documents],
+            "skipped_files": skipped,
+        }
+        changed_fields = _changed_top_level_fields(changed_paths)
+        annotate_base_snapshot_facts(structured_intel, changed_fields, req.run_id)
+        annotate_run_evidence_metadata(structured_intel, req.run_id)
+
+        warnings = []
+        if skipped:
+            warnings.append(f"Skipped {len(skipped)} selected file(s) or ZIP entries that could not be parsed.")
+        if not changed_paths:
+            warnings.append("Selected documents were parsed but did not update any extracted fields.")
+        if selected_source_documents:
+            warnings.append("Re-underwrite used selected retained original source documents plus the base run snapshot.")
+        else:
+            warnings.append("Re-underwrite used base run snapshot plus selected diligence documents; no retained original source documents were selected.")
+
+        try:
+            diff = build_run_diff(
+                base_extracted=base_extracted,
+                base_scored=base_scored,
+                base_workflow=base_workflow,
+                new_extracted=merged_extracted,
+                new_scored=new_scored,
+                new_workflow=structured_intel,
+                merge_conflicts=merge_conflicts,
+                warnings=warnings,
+            )
+        except Exception as e:
+            logger.exception("reunderwrite.diff_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+            return reunderwrite_error("diff_failed", f"Diff generation failed during re-underwrite: {e}", 500)
+        logger.info("reunderwrite.diff_complete run_id=%s deal_id=%s", req.run_id, req.deal_id)
+
+        logger.info("reunderwrite.completed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+        return {
+            "run_id": req.run_id,
+            "base_run_id": req.base_run_id,
+            "status": "completed",
+            "extracted": merged_extracted,
+            "scored": new_scored,
+            "workflow": structured_intel,
+            "diff": diff,
+            "meta": {
+                "centre_name": centre_name,
+                "source_files": source_files,
+                "skipped_files": skipped,
+            },
+        }
+    except ValueError as e:
+        logger.warning("reunderwrite.invalid_input run_id=%s deal_id=%s error=%s", req.run_id, req.deal_id, e)
+        return reunderwrite_error("invalid_input", str(e), 400)
+    except Exception as e:
+        logger.exception("reunderwrite.unexpected_failed run_id=%s deal_id=%s", req.run_id, req.deal_id)
+        return reunderwrite_error("unexpected_failed", str(e), 500)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ── P4.1: ACECQA Nearby Centres ───────────────────────────────────────────────
@@ -974,6 +1727,8 @@ async def pipeline(req: PipelineRequest):
         work_dir      = tempfile.mkdtemp(prefix='acquira-')
         storage_paths = req.resolved_paths()
         all_filenames = req.resolved_filenames()
+        pipeline_request_id = uuid.uuid4().hex
+        retained_source_files: list[dict[str, Any]] = []
 
         try:
             # ── Step 1: Download & parse all files ───────────────────────
@@ -1005,18 +1760,26 @@ async def pipeline(req: PipelineRequest):
             file_classes:  dict[str, str] = {}
             skipped:       list[str] = []
 
-            for storage_path, filename in zip(storage_paths, all_filenames):
+            for source_index, (storage_path, filename) in enumerate(zip(storage_paths, all_filenames)):
                 fname_lower = filename.lower()
                 try:
+                    validate_pipeline_temp_path(storage_path)
                     print("[pipeline] downloading file")
                     print("  bucket: uploads")
                     print("  storage_path:", storage_path)
                     print("  filename:", filename)
 
                     file_bytes = supabase.storage.from_('uploads').download(storage_path)
+                    retained_source_files.append(retain_pipeline_source_file(
+                        pipeline_request_id=pipeline_request_id,
+                        index=source_index,
+                        original_storage_path=storage_path,
+                        filename=filename,
+                        file_bytes=file_bytes,
+                    ))
 
                 except Exception as e:
-                    print("[pipeline] Supabase download failed")
+                    print("[pipeline] Supabase download/retention failed")
                     print("  bucket: uploads")
                     print("  storage_path:", storage_path)
                     print("  filename:", filename)
@@ -1024,10 +1787,10 @@ async def pipeline(req: PipelineRequest):
 
                     yield sse_event("error", {
                         "message": (
-                            "Uploaded file was not found in Supabase Storage. "
+                            "Uploaded file could not be read or retained in Supabase Storage. "
                             f"bucket=uploads path={storage_path}. "
-                            "This usually means the frontend sent a public URL instead of a bucket-relative path, "
-                            "or the file was deleted by a previous pipeline run. Please re-upload and retry."
+                            "This usually means the frontend sent an invalid path, the file was deleted by a previous pipeline run, "
+                            "or source retention failed. Please re-upload and retry."
                         )
                     })
                     return
@@ -1152,6 +1915,240 @@ async def pipeline(req: PipelineRequest):
             extracted      = json.loads(extracted_text)
             centre_name    = extracted.get('centre', {}).get('name') or 'centre'
 
+            # ── Step 2.5: Compute deterministic demand & market context ───────
+            # Python is the authoritative scorer for market_position.
+            # We resolve postcode and licensed places from extracted data,
+            # compute EDR + market score, then inject into extracted before
+            # passing to the LLM. LLM explains; it doesn't generate.
+            try:
+                _postcode = (
+                    extracted.get("centre", {}).get("postcode")
+                    or extracted.get("key_ratios", {}).get("postcode")
+                    or ""
+                )
+                _postcode = str(_postcode).strip().zfill(4) if _postcode else ""
+
+                _licensed_places = (
+                    extracted.get("centre", {}).get("licensed_places")
+                    or extracted.get("key_ratios", {}).get("licensed_places")
+                    or 0
+                )
+
+                # Pipeline intel: structured DA projects plus legacy count support.
+                # Legacy approved_das stays score-stable: each approved DA still
+                # contributes 90 approved places, matching prior behavior.
+                _pi = req.pipelineIntel
+                _pipeline_supply = build_pipeline_supply(
+                    req.pipelineProjects,
+                    _pi,
+                    search_radius_km=None,
+                )
+                _pipeline_projects = _pipeline_supply["pipeline_projects"]
+                _pipeline_audit = _pipeline_supply["pipeline_audit"]
+                _approved_pipeline_places = _pipeline_audit["approved_places"]
+                _pipeline_source = (
+                    "Structured manual DA projects."
+                    if _pipeline_audit["source_type"] == "manual_structured"
+                    else "Legacy user-provided DA count; approved DAs assume 90 places each."
+                    if _pipeline_audit["source_type"] == "manual_legacy_count"
+                    else None
+                )
+                _pipeline_searched = bool(_pipeline_audit["searched"])
+
+                # Count competitors from pipeline_mentions as proxy when no explicit intel
+                _competitor_count = 0  # will be refined by LLM narrative
+                _competitor_source = "Not verified"
+                _included_centres = 0
+
+                if _postcode:
+                    _subject_places = _licensed_places or 60
+                    _centre = extracted.get("centre", {}) or {}
+                    _postcode_supply = {
+                        "source": "unavailable",
+                        "confidence": "low",
+                        "total_licensed_places": _subject_places,
+                        "competitor_count": 0,
+                        "included_centres": 1,
+                        "source_label": "Subject licensed places fallback / manual estimate",
+                        "warnings": [],
+                    }
+                    try:
+                        _acecqa_resp = supabase.from_("acecqa_centres") \
+                            .select("licensed_places") \
+                            .eq("postcode", _postcode) \
+                            .execute()
+                        _acecqa_rows = _acecqa_resp.data or []
+                        _acecqa_total = sum((r.get("licensed_places") or 0) for r in _acecqa_rows)
+                        if _acecqa_total > 0:
+                            _postcode_supply = {
+                                "source": "postcode_fallback",
+                                "confidence": "medium",
+                                "total_licensed_places": _acecqa_total + _subject_places,
+                                "competitor_count": max(len(_acecqa_rows) - 1, 0),
+                                "included_centres": len(_acecqa_rows) + 1,
+                                "source_label": "ACECQA centres table filtered by postcode plus subject centre.",
+                                "warnings": [],
+                            }
+                        else:
+                            _is_reg = POSTCODE_AREA_KM2.get(_postcode, 50) > 200
+                            _share = 0.25 if _is_reg else 0.12
+                            _pipeline_mentions = extracted.get("pipeline_mentions", []) or []
+                            _postcode_supply = {
+                                "source": "market_share_heuristic",
+                                "confidence": "low",
+                                "total_licensed_places": round(_subject_places / _share),
+                                "competitor_count": max(len(_pipeline_mentions), 0),
+                                "included_centres": max(len(_pipeline_mentions), 0) + 1 if _pipeline_mentions else 1,
+                                "source_label": "Fallback market-share heuristic; competitor count from document pipeline mentions if present.",
+                                "warnings": ["Postcode ACECQA rows were unavailable; used market-share heuristic."],
+                            }
+                    except Exception as _sq_err:
+                        print(f"[demand_service] Supabase ACECQA query failed (non-fatal): {_sq_err}")
+                        _pipeline_mentions = extracted.get("pipeline_mentions", []) or []
+                        _postcode_supply = {
+                            "source": "postcode_query_failed",
+                            "confidence": "low",
+                            "total_licensed_places": _subject_places,
+                            "competitor_count": max(len(_pipeline_mentions), 0),
+                            "included_centres": max(len(_pipeline_mentions), 0) + 1 if _pipeline_mentions else 1,
+                            "source_label": "Fallback after ACECQA query failure; competitor count from document pipeline mentions if present.",
+                            "warnings": [f"Postcode ACECQA query failed: {_sq_err}"],
+                        }
+
+                    _radius_km = POSTCODE_AREA_KM2.get(_postcode)
+                    _geo_supply = get_nearby_competitors(
+                        supabase,
+                        address=_centre.get("address"),
+                        suburb=_centre.get("suburb"),
+                        state=_centre.get("state"),
+                        postcode=_postcode,
+                        radius_km=(
+                            2.0 if _radius_km and _radius_km < 20
+                            else 3.0 if not _radius_km or _radius_km < 80
+                            else 5.0
+                        ),
+                        subject_name=_centre.get("name"),
+                        subject_address=_centre.get("address"),
+                        service_approval_number=_centre.get("service_approval_number"),
+                        subject_licensed_places=_subject_places,
+                        lat=_centre.get("lat") or _centre.get("latitude"),
+                        lng=_centre.get("lng") or _centre.get("longitude"),
+                    )
+                    _use_geo_for_scoring = (
+                        _geo_supply.get("source") == "geospatial_supabase"
+                        and _geo_supply.get("confidence") == "high"
+                    )
+                    _scoring_supply = _geo_supply if _use_geo_for_scoring else _postcode_supply
+                    _total_catchment_places = _scoring_supply.get("total_licensed_places") or _subject_places
+                    _competitor_count = _scoring_supply.get("competitor_count") or 0
+                    _included_centres = (
+                        _competitor_count + 1
+                        if _scoring_supply.get("source") == "geospatial_supabase"
+                        else _scoring_supply.get("included_centres") or (_competitor_count + 1 if _competitor_count else 1)
+                    )
+                    _competitor_source = (
+                        "ACECQA geospatial radius via Supabase RPC get_nearby_centres."
+                        if _scoring_supply.get("source") == "geospatial_supabase"
+                        else _postcode_supply.get("source_label")
+                    )
+
+                    _demand_ctx = compute_demand(_postcode, _total_catchment_places)
+                    _pipeline_audit["search_radius_km"] = _demand_ctx.get("radius_km")
+                    _market_ctx = market_position_score(
+                        demand_context=_demand_ctx,
+                        competitor_count=_competitor_count,
+                        approved_pipeline_places=_approved_pipeline_places,
+                        subject_licensed_places=_subject_places,
+                    )
+                    _postcode_demand_ctx = compute_demand(_postcode, _postcode_supply.get("total_licensed_places") or _subject_places)
+                    _geo_demand_ctx = (
+                        compute_demand(_postcode, _geo_supply.get("total_licensed_places") or _subject_places)
+                        if _geo_supply.get("source") == "geospatial_supabase"
+                        else None
+                    )
+                    _material_difference = material_supply_difference(
+                        geospatial=_geo_supply,
+                        postcode_supply=_postcode_supply,
+                        geospatial_edr=(_geo_demand_ctx or {}).get("adj_kids_per_place", {}).get("mid"),
+                        postcode_edr=_postcode_demand_ctx.get("adj_kids_per_place", {}).get("mid"),
+                        geospatial_zone=(_geo_demand_ctx or {}).get("zone"),
+                        postcode_zone=_postcode_demand_ctx.get("zone"),
+                    )
+                    _competitor_supply = {
+                        "source": _geo_supply.get("source"),
+                        "confidence": _geo_supply.get("confidence"),
+                        "radius_km": _geo_supply.get("radius_km"),
+                        "competitor_count": _geo_supply.get("competitor_count"),
+                        "total_licensed_places": _geo_supply.get("total_licensed_places"),
+                        "target_geocode_method": _geo_supply.get("target_geocode_method"),
+                        "exclusion_method": _geo_supply.get("exclusion_method"),
+                        "scoring_source": _scoring_supply.get("source"),
+                        "scoring_confidence": _scoring_supply.get("confidence"),
+                        "compared_to_postcode": {
+                            "competitor_count": _postcode_supply.get("competitor_count"),
+                            "total_licensed_places": _postcode_supply.get("total_licensed_places"),
+                            "edr": _postcode_demand_ctx.get("adj_kids_per_place", {}).get("mid"),
+                        },
+                        "material_difference": _material_difference,
+                        "warnings": [
+                            *(_geo_supply.get("warnings") or []),
+                            *(_postcode_supply.get("warnings") or []),
+                        ],
+                    }
+                    _vendor_kids = None
+                    for _path in (
+                        ("market", "kids_0_4"),
+                        ("market", "children_0_4"),
+                        ("demographics", "kids_0_4"),
+                        ("demographics", "children_0_4"),
+                        ("key_ratios", "kids_0_4"),
+                    ):
+                        _cur = extracted
+                        for _key in _path:
+                            _cur = _cur.get(_key, {}) if isinstance(_cur, dict) else {}
+                        if isinstance(_cur, (int, float)):
+                            _vendor_kids = int(_cur)
+                            break
+                    _market_audit = build_market_audit(
+                        _demand_ctx,
+                        _market_ctx,
+                        subject_licensed_places=_subject_places,
+                        competitor_source=_competitor_source,
+                        included_centres=_included_centres,
+                        pipeline_source=_pipeline_source,
+                        pipeline_searched=_pipeline_searched,
+                        pipeline_audit=_pipeline_audit,
+                        vendor_kids_0_4=_vendor_kids,
+                        competitor_supply=_competitor_supply,
+                    )
+                    extracted["_demand_context"] = _demand_ctx
+                    extracted["_market_context"] = _market_ctx
+                    extracted["_market_audit"] = _market_audit
+                    extracted["_pipeline_projects"] = _pipeline_projects
+                    extracted["_pipeline_audit"] = _pipeline_audit
+                else:
+                    extracted["_demand_context"] = None
+                    extracted["_market_context"] = None
+                    extracted["_market_audit"] = {
+                        "warnings": ["Market audit unavailable because postcode was not extracted."],
+                    }
+                    extracted["_pipeline_projects"] = _pipeline_projects
+                    extracted["_pipeline_audit"] = _pipeline_audit
+            except Exception as _de:
+                print(f"[demand_service] error (non-fatal): {_de}")
+                extracted["_demand_context"] = None
+                extracted["_market_context"] = None
+                extracted["_market_audit"] = {
+                    "warnings": [f"Market audit unavailable because demand model failed: {_de}"],
+                }
+                try:
+                    _pipeline_supply = build_pipeline_supply(req.pipelineProjects, req.pipelineIntel)
+                    extracted["_pipeline_projects"] = _pipeline_supply["pipeline_projects"]
+                    extracted["_pipeline_audit"] = _pipeline_supply["pipeline_audit"]
+                except Exception:
+                    extracted["_pipeline_projects"] = []
+                    extracted["_pipeline_audit"] = None
+
             # ── Step 3: Score ─────────────────────────────────────────────
             yield sse_event("progress", {
                 "step": 3, "total": 5,
@@ -1178,6 +2175,15 @@ async def pipeline(req: PipelineRequest):
                     pipeline_intel_context += f"- Document mentions: {'; '.join(pipeline_mentions)}\n"
                 # Store a flag in scored data so the front-end knows pipeline intel was used
                 extracted["_pipeline_intel_used"] = True
+            if extracted.get("_pipeline_projects"):
+                pipeline_intel_context += "\n\nSTRUCTURED DA / PIPELINE PROJECTS (manual):\n"
+                for project in (extracted.get("_pipeline_projects") or [])[:10]:
+                    pipeline_intel_context += (
+                        f"- {project.get('status', 'unknown')}: "
+                        f"{project.get('name') or project.get('address') or 'Pipeline project'}"
+                        f" · {project.get('proposed_places') or 'unknown'} places"
+                        f" · confidence {project.get('confidence', 'low')}\n"
+                    )
 
             scoring_response = client.messages.create(
                 model=MODEL,
@@ -1237,6 +2243,26 @@ async def pipeline(req: PipelineRequest):
             scored['scoring_timestamp'] = datetime.now(timezone.utc).isoformat()
             if req.pipelineIntel:
                 scored['pipeline_intel_used'] = True
+            if req.pipelineProjects:
+                scored['pipeline_projects_used'] = True
+            scored['pipeline_projects'] = extracted.get('_pipeline_projects') or []
+            scored['pipeline_audit'] = extracted.get('_pipeline_audit')
+            # Attach deterministic demand context to scored output
+            # Frontend can surface EDR + zone alongside the score
+            if extracted.get('_demand_context'):
+                scored['effective_demand_ratio'] = extracted['_demand_context']['adj_kids_per_place']['mid']
+                scored['demand_zone'] = extracted['_demand_context']['zone']
+                scored['demand_context'] = extracted['_demand_context']
+                scored['market_context'] = extracted.get('_market_context')
+                scored['market_audit'] = extracted.get('_market_audit')
+
+            structured_intel = build_structured_deal_intelligence(
+                extracted=extracted,
+                scored=scored,
+                combined_text=combined_text,
+                source_files=source_files,
+                file_classes=file_classes,
+            )
 
             # ── Step 4: Clean up ALL uploaded paths ───────────────────────
             yield sse_event("progress", {
@@ -1265,10 +2291,21 @@ async def pipeline(req: PipelineRequest):
                 "success":   True,
                 "extracted": extracted,
                 "scored":    scored,
+                "deal_summary": structured_intel["deal_summary"],
+                "extracted_facts": structured_intel["extracted_facts"],
+                "missing_fields": structured_intel["missing_fields"],
+                "risks": structured_intel["risks"],
+                "valuation_gate": structured_intel["valuation_gate"],
+                "diligence_requests": structured_intel["diligence_requests"],
+                "evidence": structured_intel["evidence"],
+                "workflow": structured_intel,
+                "retained_source_files": retained_source_files,
                 "meta": {
                     "source_files":  source_files,
                     "file_classes":  file_classes,
                     "skipped_files": skipped,
+                    "pipeline_request_id": pipeline_request_id,
+                    "retained_source_files": retained_source_files,
                 }
             })
 
