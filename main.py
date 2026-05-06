@@ -33,6 +33,7 @@ app.add_middleware(
 
 MODEL      = "claude-sonnet-4-20250514"
 MAX_TOKENS = 12000
+API_RELEASE = "pipeline-retention-nonfatal-20260506"
 
 client   = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
@@ -644,7 +645,7 @@ class ReunderwriteRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "release": API_RELEASE}
 
 REUNDERWRITE_TEXT_BUDGET: dict[str, tuple[int, int]] = {
     'im_pdf':               (20000, 3),
@@ -1729,6 +1730,7 @@ async def pipeline(req: PipelineRequest):
         all_filenames = req.resolved_filenames()
         pipeline_request_id = uuid.uuid4().hex
         retained_source_files: list[dict[str, Any]] = []
+        print("[pipeline] release:", API_RELEASE)
 
         try:
             # ── Step 1: Download & parse all files ───────────────────────
