@@ -22,6 +22,42 @@ def _get(data: dict[str, Any], *path: str) -> Any:
         current = current.get(key)
     return current
 
+def _market_audit_shell(market_audit: dict[str, Any] | None, pipeline_audit: dict[str, Any] | None) -> dict[str, Any]:
+    required = {
+        "catchment radius": _get(market_audit or {}, "catchment_radius_km"),
+        "kids 0-4 count": _get(market_audit or {}, "kids_0_4", "value"),
+        "kids 0-4 source": _get(market_audit or {}, "kids_0_4", "source"),
+        "LDC utilisation assumption": _get(market_audit or {}, "ldc_utilisation_rate", "value"),
+        "centre licensed places": _get(market_audit or {}, "licensed_places", "value"),
+        "competitor count": _get(market_audit or {}, "competitor_count", "value") or _get(market_audit or {}, "competitor_supply", "competitor_count"),
+        "competitor licensed places": _get(market_audit or {}, "competitor_supply", "total_licensed_places"),
+        "geocode method": _get(market_audit or {}, "competitor_supply", "target_geocode_method"),
+        "exclusion method": _get(market_audit or {}, "competitor_supply", "exclusion_method"),
+        "postcode fallback comparison": _get(market_audit or {}, "competitor_supply", "compared_to_postcode"),
+        "pipeline projects count": _get(pipeline_audit or {}, "approved_places"),
+        "approved/under construction places": _get(pipeline_audit or {}, "approved_places"),
+        "lodged risk-adjusted places": _get(pipeline_audit or {}, "risk_adjusted_places"),
+        "EDR formula and result": _get(market_audit or {}, "edr", "value"),
+    }
+    missing = [label for label, value in required.items() if not _present(value)]
+    audit = dict(market_audit or {})
+    audit.setdefault("warnings", [])
+    if not market_audit:
+        audit["warnings"].append("Market audit inputs were not returned; render missing state and request demographic, competitor, geocode, and pipeline evidence.")
+    if not _get(audit, "competitor_supply", "source"):
+        audit["warnings"].append("Geospatial competitor data is unavailable; use postcode fallback only as a warning-level comparison.")
+    audit["missing_fields"] = missing
+    audit["status"] = "complete" if not missing else "missing" if not market_audit else "partial"
+    return audit
+
+def _vision_failure_pages(combined_text: str) -> list[int]:
+    pages: list[int] = []
+    for match in re.finditer(r"--- Page (\d+) ---\n([\s\S]*?)(?=\n--- Page \d+ ---|\Z)", combined_text or ""):
+        block = match.group(2)
+        if "VISION_EXTRACTION_ERROR:" in block:
+            pages.append(int(match.group(1)))
+    return sorted(set(pages))
+
 
 def _source_for_field(field: str, source_files: list[str], file_classes: dict[str, str]) -> str:
     if not source_files:
@@ -918,10 +954,25 @@ def build_structured_deal_intelligence(
             "linked_fact_ids": [f["id"] for f in fee_workflow_facts if f.get("id")],
             "linked_evidence_ids": [f["evidence_id"] for f in fee_workflow_facts if f.get("evidence_id")],
         })
+    vision_failed_pages = _vision_failure_pages(combined_text)
+    if vision_failed_pages:
+        page_label = ", ".join(str(page) for page in vision_failed_pages[:8])
+        extraction_warnings.append({
+            "id": "pdf_vision_financial_pages_failed",
+            "severity": "high",
+            "message": (
+                f"Financial/high-value pages were detected on pages {page_label}, but image-table extraction failed because "
+                "the vision provider was not configured/authenticated or returned an error. Re-run with valid provider "
+                "credentials or upload the P&L as Excel/CSV."
+            ),
+            "field": "financials",
+            "linked_fact_ids": [],
+            "linked_evidence_ids": [],
+        })
 
     deal_summary = build_deal_summary(extracted, scored)
-    market_audit = scored.get("market_audit") or extracted.get("_market_audit")
     pipeline_audit = scored.get("pipeline_audit") or extracted.get("_pipeline_audit")
+    market_audit = _market_audit_shell(scored.get("market_audit") or extracted.get("_market_audit"), pipeline_audit)
     narrative_guard = build_narrative_guard(
         extracted=extracted,
         scored=scored,

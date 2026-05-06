@@ -1,4 +1,4 @@
-import os, json, re, base64, tempfile, shutil, copy, uuid, mimetypes, logging
+import os, json, re, base64, tempfile, shutil, copy, uuid, mimetypes, logging, csv, subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, List
@@ -35,7 +35,75 @@ MODEL      = "claude-sonnet-4-20250514"
 MAX_TOKENS = 12000
 API_RELEASE = "pipeline-retention-nonfatal-20260506"
 
-client   = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+HIGH_VALUE_PAGE_KEYWORDS = (
+    "profit and loss", "p&l", "income statement", "management accounts", "payroll",
+    "wages", "roster", "occupancy", "utilisation", "utilization", "enrolment",
+    "rent", "lease", "fee schedule", "assessment and rating", "nqs", "market",
+    "demographic", "competitor", "development application", "pipeline",
+)
+
+VISION_PROVIDER = "anthropic"
+VISION_AUTH_INVALID_RE = re.compile(r"401|invalid x-api-key|authentication_error|unauthorized", re.I)
+
+def classify_vision_provider_error(error: Exception | str) -> str:
+    message = str(error)
+    if VISION_AUTH_INVALID_RE.search(message):
+        return "invalid_auth"
+    return "provider_error"
+
+def validate_vision_provider_config() -> dict[str, Any]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key or not api_key.strip():
+        return {
+            "provider": VISION_PROVIDER,
+            "model": MODEL,
+            "configured": False,
+            "auth_status": "missing_api_key",
+            "errors": ["ANTHROPIC_API_KEY is missing or empty."],
+        }
+    return {
+        "provider": VISION_PROVIDER,
+        "model": MODEL,
+        "configured": True,
+        "auth_status": "unknown",
+        "errors": [],
+    }
+
+async def vision_provider_smoke_test() -> dict[str, Any]:
+    diagnostics = validate_vision_provider_config()
+    if diagnostics["auth_status"] == "missing_api_key":
+        return diagnostics
+    try:
+        doc = fitz.open()
+        page = doc.new_page(width=360, height=120)
+        page.insert_text((24, 60), "VISION_SMOKE_TEST_OK 12345", fontsize=16)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        image_b64 = base64.standard_b64encode(pix.tobytes("png")).decode()
+        doc.close()
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                    {"type": "text", "text": "Read the text in this image. Return only the text."},
+                ],
+            }],
+        )
+        text = response.content[0].text if response.content[0].type == "text" else ""
+        diagnostics["auth_status"] = "ok" if "VISION_SMOKE_TEST_OK" in text and "12345" in text else "provider_error"
+        if diagnostics["auth_status"] != "ok":
+            diagnostics["errors"].append("Vision smoke test response did not contain expected marker.")
+        return diagnostics
+    except Exception as e:
+        diagnostics["auth_status"] = classify_vision_provider_error(e)
+        diagnostics["configured"] = True
+        diagnostics["errors"].append(str(e))
+        return diagnostics
+
+client   = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "missing-api-key")
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -51,6 +119,7 @@ RULES:
 6. You are state-aware: VIC, NSW, and QLD have different kinder/preschool funding regimes, regulatory bodies, and wage award rates.
 7. For occupancy: use the most recent data available. Priority order: (1) most recent 4-week average, (2) most recent month, (3) annual average.
 8. For financials: extract ALL years available (FY23, FY24, FY25). Prefer audited or management accounts over vendor summaries.
+8a. Excel/workbook evidence can be the most authoritative source for financials, occupancy, payroll, staffing, and management accounts. If workbook tabs conflict with IM brochure text, prefer the workbook and cite the sheet/cell coordinates from the digest in anomalies or source_files.
 9. RATIO CALCULATIONS - always calculate from raw numbers:
    - labour_ratio_pct = (total_labour_cost / revenue) x 100
    - rent_ratio_pct = (rent_pa / revenue) x 100
@@ -406,6 +475,189 @@ def extract_pdf_text(pdf_path: str) -> str:
     except Exception:
         return ''
 
+def should_vision_extract_page(page_text: str, page_number: int, visual_context: str = "") -> tuple[bool, str]:
+    combined = f"{page_text}\n{visual_context}".lower()
+    has_high_value_context = any(keyword in combined for keyword in HIGH_VALUE_PAGE_KEYWORDS)
+    if not has_high_value_context:
+        return False, ""
+    compact = re.sub(r"\s+", " ", page_text or "").strip()
+    numbers = re.findall(r"[\$]?\d[\d,]*(?:\.\d+)?%?", compact)
+    sparse = len(compact) < 450 or (len(numbers) < 8 and len(compact) < 1200)
+    if sparse:
+        return True, f"sparse high-value evidence page {page_number}"
+    return False, ""
+
+def render_pdf_page_to_image(pdf_path: str, page_index: int) -> str:
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        return base64.standard_b64encode(pix.tobytes("png")).decode()
+    finally:
+        doc.close()
+
+def local_ocr_extract_page(pdf_path: str, filename: str, page_index: int, reason: str) -> str:
+    if os.environ.get("ENABLE_LOCAL_OCR_FALLBACK", "").lower() not in {"1", "true", "yes"}:
+        return ""
+    if not shutil.which("tesseract"):
+        logger.debug("pdf.local_ocr_unavailable filename=%s page=%s reason=tesseract_not_found", filename, page_index + 1)
+        return (
+            f"--- Page {page_index + 1} ---\n"
+            f"SOURCE_FILE: {filename}\n"
+            f"PAGE: {page_index + 1}\n"
+            "EXTRACTION_METHOD: pdf_local_ocr_unavailable\n"
+            "LOCAL_OCR_WARNING: ENABLE_LOCAL_OCR_FALLBACK was set, but tesseract was not found."
+        )
+    try:
+        image_b64 = render_pdf_page_to_image(pdf_path, page_index)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image_file:
+            image_file.write(base64.standard_b64decode(image_b64))
+            image_path = image_file.name
+        try:
+            completed = subprocess.run(
+                ["tesseract", image_path, "stdout"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            try:
+                os.unlink(image_path)
+            except OSError:
+                pass
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return (
+                f"--- Page {page_index + 1} ---\n"
+                f"SOURCE_FILE: {filename}\n"
+                f"PAGE: {page_index + 1}\n"
+                "EXTRACTION_METHOD: pdf_local_ocr\n"
+                "LOCAL_OCR_WARNING: Local OCR did not return readable text; needs manual review."
+            )
+        return (
+            f"--- Page {page_index + 1} ---\n"
+            f"SOURCE_FILE: {filename}\n"
+            f"PAGE: {page_index + 1}\n"
+            "EXTRACTION_METHOD: pdf_local_ocr\n"
+            "LOCAL_OCR_WARNING: Local OCR fallback used after vision provider failure; review extracted numbers before underwriting.\n"
+            f"FALLBACK_REASON: {reason}\n"
+            f"{completed.stdout.strip()}"
+        )
+    except Exception as e:
+        return (
+            f"--- Page {page_index + 1} ---\n"
+            f"SOURCE_FILE: {filename}\n"
+            f"PAGE: {page_index + 1}\n"
+            "EXTRACTION_METHOD: pdf_local_ocr\n"
+            f"LOCAL_OCR_WARNING: Local OCR failed: {e}"
+        )
+
+async def vision_extract_page(image_b64: str, filename: str, page_number: int, reason: str) -> str:
+    config = validate_vision_provider_config()
+    if config["auth_status"] == "missing_api_key":
+        return (
+            f"--- Page {page_number} ---\n"
+            f"SOURCE_FILE: {filename}\n"
+            f"PAGE: {page_number}\n"
+            "EXTRACTION_METHOD: pdf_vision\n"
+            "VISION_PROVIDER_STATUS: missing_api_key\n"
+            "VISION_EXTRACTION_ERROR: ANTHROPIC_API_KEY is missing or empty.\n"
+            f"FALLBACK_REASON: {reason}"
+        )
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2500,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                    {"type": "text", "text": (
+                        f"Extract all visible text, tables, row labels, column labels, and numbers from page {page_number} "
+                        f"of {filename}. This page was selected because: {reason}. "
+                        "Return plain text only. Preserve table structure as markdown-like rows when possible. "
+                        f"Begin with --- Page {page_number} --- and include SOURCE_FILE, PAGE, EXTRACTION_METHOD: pdf_vision."
+                    )},
+                ],
+            }],
+        )
+        return response.content[0].text if response.content[0].type == "text" else ""
+    except Exception as e:
+        status = classify_vision_provider_error(e)
+        print(f"Page vision extraction failed ({filename} page {page_number}): {e}")
+        return (
+            f"--- Page {page_number} ---\n"
+            f"SOURCE_FILE: {filename}\n"
+            f"PAGE: {page_number}\n"
+            "EXTRACTION_METHOD: pdf_vision\n"
+            f"VISION_PROVIDER_STATUS: {status}\n"
+            f"VISION_EXTRACTION_ERROR: {e}\n"
+            f"FALLBACK_REASON: {reason}"
+        )
+
+async def extract_pdf_pages_with_fallback(pdf_path: str, filename: str, purpose: str) -> str:
+    parts: list[str] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            fitz_doc = fitz.open(pdf_path)
+            try:
+                for idx, page in enumerate(pdf.pages, start=1):
+                    parsed_text = page.extract_text() or ""
+                    visual_context = ""
+                    try:
+                        visual_context = fitz_doc[idx - 1].get_text("text") or ""
+                    except Exception:
+                        visual_context = ""
+                    should_extract, reason = should_vision_extract_page(parsed_text, idx, visual_context)
+                    if should_extract:
+                        logger.debug(
+                            "pdf.page_vision_fallback filename=%s page=%s reason=%s parsed_chars=%s",
+                            filename,
+                            idx,
+                            reason,
+                            len(parsed_text or ""),
+                        )
+                        image = render_pdf_page_to_image(pdf_path, idx - 1)
+                        vision_text = await vision_extract_page(image, filename, idx, reason)
+                        if "VISION_EXTRACTION_ERROR:" in vision_text:
+                            ocr_text = local_ocr_extract_page(pdf_path, filename, idx - 1, reason)
+                            if ocr_text:
+                                parts.append(ocr_text.strip())
+                        if vision_text.strip():
+                            parts.append(vision_text.strip())
+                            continue
+                    if parsed_text.strip():
+                        parts.append(
+                            f"--- Page {idx} ---\n"
+                            f"SOURCE_FILE: {filename}\n"
+                            f"PAGE: {idx}\n"
+                            f"EXTRACTION_METHOD: pdf_text\n"
+                            f"{parsed_text.strip()}"
+                        )
+                    elif any(keyword in visual_context.lower() for keyword in HIGH_VALUE_PAGE_KEYWORDS):
+                        logger.debug(
+                            "pdf.page_vision_fallback filename=%s page=%s reason=%s parsed_chars=%s",
+                            filename,
+                            idx,
+                            f"blank parsed text on {purpose} page",
+                            len(parsed_text or ""),
+                        )
+                        image = render_pdf_page_to_image(pdf_path, idx - 1)
+                        vision_text = await vision_extract_page(image, filename, idx, f"blank parsed text on {purpose} page")
+                        if "VISION_EXTRACTION_ERROR:" in vision_text:
+                            ocr_text = local_ocr_extract_page(pdf_path, filename, idx - 1, f"blank parsed text on {purpose} page")
+                            if ocr_text:
+                                parts.append(ocr_text.strip())
+                        if vision_text.strip():
+                            parts.append(vision_text.strip())
+            finally:
+                fitz_doc.close()
+        return "\n\n".join(parts)[:100000]
+    except Exception as e:
+        print(f"PDF page extraction failed ({filename}): {e}")
+        return extract_pdf_text(pdf_path)
+
 def is_pdf_scanned(text: str) -> bool:
     trimmed = text.strip()
     if len(trimmed) < 200:
@@ -446,35 +698,143 @@ async def extract_scanned_pdf_text(pdf_path: str, purpose: str) -> str:
         return ''
 
 def extract_excel_text(xlsx_path: str) -> str:
-    """Extract text from .xlsx or legacy .xls files."""
+    """Extract workbook-aware text from .xlsx, legacy .xls, or .csv files."""
     path_lower = xlsx_path.lower()
+    workbook_name = Path(xlsx_path).name
+
+    def sheet_category(sheet_name: str) -> str:
+        s = sheet_name.lower()
+        if any(k in s for k in ("adjusted actuals", "myob", "source", "management", "actuals", "p&l", "profit", "loss")):
+            return "financials"
+        if any(k in s for k in ("occupancy", "utilisation", "utilization", "xplor", "enrol")):
+            return "occupancy"
+        if any(k in s for k in ("workedhours", "worked hours", "staff", "pay run", "payroll", "employment hero", "leave")):
+            return "payroll_staffing"
+        if any(k in s for k in ("summary", "details")):
+            return "summary"
+        return "other"
+
+    def row_values_with_cells(cells: list[tuple[str, Any, Any]]) -> str:
+        parts = []
+        for coord, value, formula in cells:
+            if value is None and formula is None:
+                continue
+            if formula and formula != value:
+                parts.append(f"{coord}={value} (formula {formula})")
+            else:
+                parts.append(f"{coord}={value}")
+        return " | ".join(parts)
+
     try:
+        if path_lower.endswith(".csv"):
+            out = [f"WORKBOOK_DIGEST: {workbook_name}", "WARNING: CSV has one flat worksheet and no formulas."]
+            with open(xlsx_path, newline="", encoding="utf-8-sig", errors="replace") as handle:
+                reader = csv.reader(handle)
+                for row_index, row in enumerate(reader, start=1):
+                    if any(str(value).strip() for value in row):
+                        cells = [(f"R{row_index}C{col_index}", value, None) for col_index, value in enumerate(row, start=1)]
+                        out.append(row_values_with_cells(cells))
+                    if len(out) > 1500:
+                        out.append("WARNING: CSV truncated after 1500 digest lines.")
+                        break
+            return "\n".join(out)
+
         if path_lower.endswith('.xls') and not path_lower.endswith('.xlsx'):
             # Legacy BIFF format — openpyxl cannot read this
             wb = xlrd.open_workbook(xlsx_path)
-            out = []
+            out = [f"WORKBOOK_DIGEST: {workbook_name}"]
             for sheet in wb.sheets():
-                out.append(f'Sheet: {sheet.name}')
+                if sheet.visibility != 0:
+                    out.append(f"WARNING: skipped hidden sheet {sheet.name}")
+                    continue
+                out.append(f"\nSHEET: {sheet.name}")
+                out.append(f"DETECTED_CATEGORY: {sheet_category(sheet.name)}")
+                out.append(f"USED_RANGE: R1C1:R{sheet.nrows}C{sheet.ncols}")
+                nonempty_rows = 0
                 for rx in range(sheet.nrows):
-                    row = [str(sheet.cell_value(rx, cx)) for cx in range(sheet.ncols)]
-                    line = ','.join(v for v in row if v.strip())
-                    if line:
-                        out.append(line)
-                    if len(out) >= 1000:
+                    cells = []
+                    for cx in range(sheet.ncols):
+                        value = sheet.cell_value(rx, cx)
+                        if value not in ("", None):
+                            cells.append((f"R{rx + 1}C{cx + 1}", value, None))
+                    if cells:
+                        out.append(row_values_with_cells(cells))
+                        nonempty_rows += 1
+                    if nonempty_rows >= 160:
+                        out.append(f"WARNING: sheet {sheet.name} truncated after 160 non-empty rows.")
                         break
-            return '\n'.join(out[:1000])
+            return '\n'.join(out[:12000])
         else:
-            wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-            out = []
-            for sheet in wb.sheetnames:
-                ws = wb[sheet]
-                out.append(f'Sheet: {sheet}')
-                for row in ws.iter_rows(values_only=True):
-                    if any(v is not None for v in row):
-                        out.append(','.join(str(v) if v is not None else '' for v in row))
-                    if len(out) >= 1000:
+            value_wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=False)
+            formula_wb = openpyxl.load_workbook(xlsx_path, data_only=False, read_only=False)
+            visible_names = [name for name in value_wb.sheetnames if value_wb[name].sheet_state == "visible"]
+            hidden_names = [name for name in value_wb.sheetnames if value_wb[name].sheet_state != "visible"]
+            priority = {"financials": 0, "occupancy": 1, "payroll_staffing": 2, "summary": 3, "other": 4}
+            visible_names.sort(key=lambda name: (priority.get(sheet_category(name), 9), value_wb.sheetnames.index(name)))
+            out = [f"WORKBOOK_DIGEST: {workbook_name}"]
+            if hidden_names:
+                out.append(f"EXTRACTION_WARNING: hidden sheets skipped: {', '.join(hidden_names)}")
+            logger.debug(
+                "excel.workbook_digest workbook=%s visible_sheets=%s hidden_sheets=%s",
+                workbook_name,
+                len(visible_names),
+                hidden_names,
+            )
+            for sheet in visible_names:
+                ws = value_wb[sheet]
+                formula_ws = formula_wb[sheet]
+                if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
+                    out.append(f"EXTRACTION_WARNING: skipped empty sheet {sheet}")
+                    logger.debug("excel.sheet_skipped workbook=%s sheet=%s reason=empty", workbook_name, sheet)
+                    continue
+                category = sheet_category(sheet)
+                logger.debug(
+                    "excel.sheet_digest workbook=%s sheet=%s category=%s used_range=%s",
+                    workbook_name,
+                    sheet,
+                    category,
+                    ws.calculate_dimension(),
+                )
+                out.append(f"\nSHEET: {sheet}")
+                out.append(f"DETECTED_CATEGORY: {category}")
+                out.append(f"USED_RANGE: {ws.calculate_dimension()}")
+                header_rows = []
+                key_rows = []
+                extracted_numbers = []
+                nonempty_rows = 0
+                for row in ws.iter_rows():
+                    row_cells = []
+                    has_text = False
+                    has_number = False
+                    for cell in row:
+                        formula_value = formula_ws[cell.coordinate].value
+                        value = cell.value
+                        if value is None and formula_value is None:
+                            continue
+                        row_cells.append((cell.coordinate, value, formula_value if isinstance(formula_value, str) and formula_value.startswith("=") else None))
+                        has_text = has_text or isinstance(value, str)
+                        has_number = has_number or isinstance(value, (int, float))
+                    if not row_cells:
+                        continue
+                    rendered = row_values_with_cells(row_cells)
+                    if has_text and len(header_rows) < 12:
+                        header_rows.append(rendered)
+                    if has_number and len(extracted_numbers) < 60:
+                        extracted_numbers.append(rendered)
+                    if len(key_rows) < 140:
+                        key_rows.append(rendered)
+                    nonempty_rows += 1
+                    if nonempty_rows >= 260:
+                        out.append(f"EXTRACTION_WARNING: sheet {sheet} truncated after 260 non-empty rows; earlier header/key rows retained.")
                         break
-            return '\n'.join(out[:1000])
+                out.append("HEADERS:")
+                out.extend(header_rows or ["none detected"])
+                out.append("KEY_ROWS:")
+                out.extend(key_rows)
+                out.append("EXTRACTED_NUMBERS:")
+                out.extend(extracted_numbers or ["none detected"])
+                out.append(f"EVIDENCE_REFS: use {workbook_name} / {sheet} / cell coordinates shown above")
+            return '\n'.join(out[:24000])
     except Exception as e:
         print(f"Excel extraction failed ({xlsx_path}): {e}")
         return ''
@@ -817,7 +1177,10 @@ async def parse_diligence_documents(
                     entry_path = os.path.join(work_dir, f"{index}_{_safe_local_name(base_name)}")
                     with open(entry_path, "wb") as f:
                         f.write(zf.read(entry_name))
-                    text = _extract_file_text(entry_path, base_name)
+                    if base_name.lower().endswith(".pdf"):
+                        text = await extract_pdf_pages_with_fallback(entry_path, base_name, file_class.replace("_", " "))
+                    else:
+                        text = _extract_file_text(entry_path, base_name)
                     if base_name.lower().endswith(".pdf") and is_pdf_scanned(text):
                         text = await extract_scanned_pdf_text(entry_path, file_class.replace("_", " "))
                     class_counts[file_class] = class_counts.get(file_class, 0) + 1
@@ -835,7 +1198,7 @@ async def parse_diligence_documents(
         file_path = os.path.join(work_dir, f"{index}_{_safe_local_name(filename)}")
         with open(file_path, "wb") as f:
             f.write(file_bytes)
-        text = _extract_file_text(file_path, filename)
+        text = await extract_pdf_pages_with_fallback(file_path, filename, file_class.replace("_", " ")) if fname_lower.endswith(".pdf") else _extract_file_text(file_path, filename)
         if fname_lower.endswith(".pdf") and is_pdf_scanned(text):
             text = await extract_scanned_pdf_text(file_path, file_class.replace("_", " "))
         class_counts[file_class] = class_counts.get(file_class, 0) + 1
@@ -902,7 +1265,10 @@ async def parse_source_documents(
                     entry_path = os.path.join(work_dir, f"{index}_source_{_safe_local_name(base_name)}")
                     with open(entry_path, "wb") as f:
                         f.write(zf.read(entry_name))
-                    text = _extract_file_text(entry_path, base_name)
+                    if base_name.lower().endswith(".pdf"):
+                        text = await extract_pdf_pages_with_fallback(entry_path, base_name, file_class.replace("_", " "))
+                    else:
+                        text = _extract_file_text(entry_path, base_name)
                     if base_name.lower().endswith(".pdf") and is_pdf_scanned(text):
                         text = await extract_scanned_pdf_text(entry_path, file_class.replace("_", " "))
                     class_counts[file_class] = class_counts.get(file_class, 0) + 1
@@ -920,7 +1286,7 @@ async def parse_source_documents(
         file_path = os.path.join(work_dir, f"{index}_source_{_safe_local_name(filename)}")
         with open(file_path, "wb") as f:
             f.write(file_bytes)
-        text = _extract_file_text(file_path, filename)
+        text = await extract_pdf_pages_with_fallback(file_path, filename, file_class.replace("_", " ")) if fname_lower.endswith(".pdf") else _extract_file_text(file_path, filename)
         if fname_lower.endswith(".pdf") and is_pdf_scanned(text):
             text = await extract_scanned_pdf_text(file_path, file_class.replace("_", " "))
         class_counts[file_class] = class_counts.get(file_class, 0) + 1
@@ -1853,7 +2219,11 @@ async def pipeline(req: PipelineRequest):
                             with open(entry_path, 'wb') as f:
                                 f.write(zf.read(entry_name))
 
-                            text = _extract_file_text(entry_path, base_name)
+                            text = await extract_pdf_pages_with_fallback(
+                                entry_path,
+                                base_name,
+                                file_class.replace('_', ' '),
+                            ) if base_name.lower().endswith('.pdf') else _extract_file_text(entry_path, base_name)
 
                             # Vision fallback for scanned PDFs
                             if base_name.lower().endswith('.pdf') and is_pdf_scanned(text):
@@ -1890,7 +2260,11 @@ async def pipeline(req: PipelineRequest):
                     with open(file_path, 'wb') as f:
                         f.write(file_bytes)
 
-                    text = _extract_file_text(file_path, filename)
+                    text = await extract_pdf_pages_with_fallback(
+                        file_path,
+                        filename,
+                        file_class.replace('_', ' '),
+                    ) if fname_lower.endswith('.pdf') else _extract_file_text(file_path, filename)
 
                     # Vision fallback for scanned PDFs
                     if fname_lower.endswith('.pdf') and is_pdf_scanned(text):
