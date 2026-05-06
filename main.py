@@ -747,7 +747,7 @@ def retain_pipeline_source_file(
     supabase.storage.from_("uploads").upload(
         retained_storage_path,
         file_bytes,
-        {"content-type": content_type, "upsert": False},
+        {"content-type": content_type, "x-upsert": "true"},
     )
     return {
         "original_storage_path": original_storage_path,
@@ -1759,27 +1759,14 @@ async def pipeline(req: PipelineRequest):
             source_files:  list[str] = []
             file_classes:  dict[str, str] = {}
             skipped:       list[str] = []
+            retention_warnings: list[str] = []
 
             for source_index, (storage_path, filename) in enumerate(zip(storage_paths, all_filenames)):
                 fname_lower = filename.lower()
                 try:
                     validate_pipeline_temp_path(storage_path)
-                    print("[pipeline] downloading file")
-                    print("  bucket: uploads")
-                    print("  storage_path:", storage_path)
-                    print("  filename:", filename)
-
-                    file_bytes = supabase.storage.from_('uploads').download(storage_path)
-                    retained_source_files.append(retain_pipeline_source_file(
-                        pipeline_request_id=pipeline_request_id,
-                        index=source_index,
-                        original_storage_path=storage_path,
-                        filename=filename,
-                        file_bytes=file_bytes,
-                    ))
-
                 except Exception as e:
-                    print("[pipeline] Supabase download/retention failed")
+                    print("[pipeline] invalid Supabase storage path")
                     print("  bucket: uploads")
                     print("  storage_path:", storage_path)
                     print("  filename:", filename)
@@ -1787,13 +1774,52 @@ async def pipeline(req: PipelineRequest):
 
                     yield sse_event("error", {
                         "message": (
-                            "Uploaded file could not be read or retained in Supabase Storage. "
+                            "Uploaded file path is invalid. "
                             f"bucket=uploads path={storage_path}. "
-                            "This usually means the frontend sent an invalid path, the file was deleted by a previous pipeline run, "
-                            "or source retention failed. Please re-upload and retry."
+                            "Please re-upload and retry."
                         )
                     })
                     return
+
+                try:
+                    print("[pipeline] downloading file")
+                    print("  bucket: uploads")
+                    print("  storage_path:", storage_path)
+                    print("  filename:", filename)
+                    file_bytes = supabase.storage.from_('uploads').download(storage_path)
+                except Exception as e:
+                    print("[pipeline] Supabase download failed")
+                    print("  bucket: uploads")
+                    print("  storage_path:", storage_path)
+                    print("  filename:", filename)
+                    print("  error:", repr(e))
+
+                    yield sse_event("error", {
+                        "message": (
+                            "Uploaded file could not be read from Supabase Storage. "
+                            f"bucket=uploads path={storage_path}. "
+                            "This usually means the frontend sent an invalid path or the file was deleted by a previous pipeline run. "
+                            "Please re-upload and retry."
+                        )
+                    })
+                    return
+
+                try:
+                    retained_source_files.append(retain_pipeline_source_file(
+                        pipeline_request_id=pipeline_request_id,
+                        index=source_index,
+                        original_storage_path=storage_path,
+                        filename=filename,
+                        file_bytes=file_bytes,
+                    ))
+                except Exception as e:
+                    warning = f"Source retention failed for {filename}; continuing with uploaded file for this run."
+                    retention_warnings.append(warning)
+                    print("[pipeline] Supabase source retention failed (non-fatal)")
+                    print("  bucket: uploads")
+                    print("  storage_path:", storage_path)
+                    print("  filename:", filename)
+                    print("  error:", repr(e))
 
                 # ── ZIP: extract contained files ──────────────────────────
                 if fname_lower.endswith('.zip'):
@@ -2300,10 +2326,12 @@ async def pipeline(req: PipelineRequest):
                 "evidence": structured_intel["evidence"],
                 "workflow": structured_intel,
                 "retained_source_files": retained_source_files,
+                "retention_warnings": retention_warnings,
                 "meta": {
                     "source_files":  source_files,
                     "file_classes":  file_classes,
                     "skipped_files": skipped,
+                    "retention_warnings": retention_warnings,
                     "pipeline_request_id": pipeline_request_id,
                     "retained_source_files": retained_source_files,
                 }
