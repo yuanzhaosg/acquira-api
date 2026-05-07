@@ -487,6 +487,144 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertEqual(fields["avg_13wk_occupancy_pct"]["underwriting_use"], "blocked")
         self.assertIn("13 weekly observations", fields["avg_13wk_occupancy_pct"]["period"]["coverage_reason"])
 
+    def test_canonical_facts_prevent_legacy_financial_contradictions(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["im.pdf", "databook.xlsx"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 163000, "ebitda": 336000, "total_labour_cost": 30000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== databook.xlsx (pl_excel) ===\n"
+                "SHEET: Adjusted Actuals\n"
+                "D23=Total revenue FY25 | E23=2374250\n"
+                "D30=Total Employment Costs FY25 | E30=1289062\n"
+                "D41=EBITDA FY25 | E41=347218\n"
+            ),
+            source_files=["im.pdf", "databook.xlsx"],
+            file_classes={"im.pdf": "im_pdf", "databook.xlsx": "pl_excel"},
+        )
+
+        canonical = workflow["canonical_facts"]
+        self.assertEqual(canonical["revenue"]["value"], 2374250)
+        self.assertEqual(canonical["payroll_labour_cost"]["value"], 1289062)
+        self.assertNotEqual(canonical["revenue"]["value"], 163000)
+        self.assertEqual(canonical["revenue"]["status"], "conflicting")
+
+    def test_valuation_gate_summary_uses_underwriting_use_not_present(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["management.xlsx"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== management.xlsx (pl_excel) ===\n"
+                "SHEET: Management Accounts YTD May25-Feb26\n"
+                "D23=Total revenue YTD | E23=900000\n"
+                "D30=Total Employment Costs YTD | E30=520000\n"
+                "D41=EBITDA YTD | E41=140000\n"
+            ),
+            source_files=["management.xlsx"],
+            file_classes={"management.xlsx": "pl_excel"},
+        )
+
+        rows = {row["field"]: row for row in workflow["valuation_gate_summary"]["rows"]}
+        self.assertEqual(rows["revenue"]["evidence"], "found")
+        self.assertEqual(rows["revenue"]["underwriting_use"], "review_required")
+        self.assertIn("review", rows["revenue"]["underwriting_use"])
+
+    def test_market_audit_sanitizes_provider_errors_and_normalizes_fallback(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["im.pdf"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000, "total_labour_cost": 550000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+                "_market_audit": {
+                    "warnings": ["{'code': '42703', 'message': 'column acecqa_centres.service_approval_number does not exist'}"],
+                    "competitor_supply": {
+                        "source": "unavailable",
+                        "confidence": "low",
+                        "competitor_count": 0,
+                        "total_licensed_places": 74,
+                        "warnings": ["postgres column acecqa_centres.service_approval_number does not exist"],
+                        "compared_to_postcode": {"competitor_count": 6, "total_licensed_places": 736, "edr": 0.92},
+                    },
+                },
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text="",
+            source_files=["im.pdf"],
+            file_classes={"im.pdf": "im_pdf"},
+        )
+
+        audit = workflow["market_audit"]
+        warnings = " ".join(audit["warnings"] + audit["competitor_supply"]["warnings"])
+        self.assertNotIn("42703", warnings)
+        self.assertNotIn("column acecqa", warnings.lower())
+        self.assertIn("Competitor lookup failed", warnings)
+        self.assertIsNone(audit["competitor_supply"]["competitor_count"])
+        self.assertIsNone(audit["competitor_supply"]["total_licensed_places"])
+        self.assertEqual(audit["competitor_supply"]["compared_to_postcode"]["competitor_count"], 6)
+
+    def test_missing_occupancy_fields_collapse_to_document_request(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["im.pdf"], "missing_fields": ["latest_week_occupancy_pct", "avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "lease_expiry"]},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000, "total_labour_cost": 550000}},
+                "occupancy": {},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text="",
+            source_files=["im.pdf"],
+            file_classes={"im.pdf": "im_pdf"},
+        )
+
+        requests = [item["question"] for item in workflow["diligence_checklist"]]
+        joined = " ".join(requests)
+        self.assertIn("Upload occupancy/utilisation export", joined)
+        self.assertIn("Upload executed lease", joined)
+        self.assertNotIn("avg_4wk_occupancy_pct", joined)
+
+    def test_evidence_quality_not_high_when_underwriting_requires_review(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["management.xlsx"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== management.xlsx (pl_excel) ===\n"
+                "SHEET: Management Accounts YTD May25-Feb26\n"
+                "D23=Total revenue YTD | E23=900000\n"
+                "D30=Total Employment Costs YTD | E30=520000\n"
+                "D41=EBITDA YTD | E41=140000\n"
+            ),
+            source_files=["management.xlsx"],
+            file_classes={"management.xlsx": "pl_excel"},
+        )
+
+        self.assertNotEqual(workflow["evidence_quality"]["evidence_quality"], "High")
+        self.assertEqual(workflow["evidence_quality"]["underwriting_reliability"], "Review required")
+
 
 if __name__ == "__main__":
     unittest.main()

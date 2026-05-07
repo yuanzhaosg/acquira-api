@@ -11,6 +11,22 @@ BLOCKED_VALUATION_MESSAGE = (
 EXTRACTOR_VERSION = "document-extraction-hardening-20260507"
 PROMPT_VERSION = "extraction-system-v20260507"
 VALUATION_REQUIRED_FIELDS = {"revenue", "ebitda", "normalised_ebitda", "payroll_labour_cost", "rent_pa", "avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "latest_week_occupancy_pct"}
+CANONICAL_FIELD_ALIASES = {
+    "revenue": ["revenue"],
+    "ebitda": ["ebitda", "operating_profit"],
+    "normalised_ebitda": ["normalised_ebitda", "normalized_ebitda"],
+    "payroll_labour_cost": ["payroll_labour_cost", "labour_cost", "labor_cost", "wages_salaries"],
+    "rent": ["rent_pa", "rent", "lease_rent"],
+    "current_occupancy": ["current_occupancy_pct", "current_month_occupancy_pct"],
+    "avg_4wk_occupancy": ["avg_4wk_occupancy_pct"],
+    "avg_13wk_occupancy": ["avg_13wk_occupancy_pct"],
+    "licensed_places": ["licensed_places"],
+    "asking_price": ["asking_price", "price_guide"],
+    "lease_expiry": ["lease_expiry", "lease_term", "lease_remaining_term"],
+}
+UNDERWRITING_USE_RANK = {"accepted": 4, "review_required": 3, "blocked": 2, "excluded": 1}
+SOURCE_QUALITY_RANK = {"authoritative": 5, "supporting": 4, "broker_summary": 3, "manual": 2, "unknown": 1, "template_or_forecast": 0}
+TRUST_RANK = {"high": 5, "medium": 4, "low": 3, "unknown": 2, "disputed": 1}
 
 
 def _present(value: Any) -> bool:
@@ -67,7 +83,41 @@ def _market_audit_shell(market_audit: dict[str, Any] | None, pipeline_audit: dic
         audit["warnings"].append("Geospatial competitor data is unavailable; use postcode fallback only as a warning-level comparison.")
     audit["missing_fields"] = missing
     audit["status"] = "complete" if not missing else "missing" if not market_audit else "partial"
+    audit["warnings"] = _sanitize_warning_list(audit.get("warnings") or [])
+    if isinstance(audit.get("competitor_supply"), dict):
+        supply = audit["competitor_supply"]
+        supply["warnings"] = _sanitize_warning_list(supply.get("warnings") or [])
+        if supply.get("source") in {None, "unavailable"} and supply.get("confidence") in {None, "low"}:
+            if (supply.get("competitor_count") in {0, None}) and supply.get("compared_to_postcode"):
+                supply["competitor_count"] = None
+                supply["total_licensed_places"] = None
+                supply["source"] = "unavailable"
+                supply["warnings"].append(
+                    "Geospatial competitor supply was unavailable. Postcode fallback was retained for scoring comparison and should be reviewed."
+                )
     return audit
+
+
+def _sanitize_warning(message: Any) -> str:
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    if not text:
+        return ""
+    if re.search(r"\b(42703|column .* does not exist|postgres|supabase|rpc|schema cache|PGRST|KeyError|Traceback|Exception|\{.*\})\b", text, re.IGNORECASE):
+        if re.search(r"competitor|acecqa|geospatial|service_approval", text, re.IGNORECASE):
+            return "Competitor lookup failed due to market-data configuration. Postcode fallback was used; verify competitor methodology before relying on market score."
+        return "A data provider lookup failed. Review methodology before relying on this section."
+    return text
+
+
+def _sanitize_warning_list(messages: list[Any]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        clean = _sanitize_warning(message)
+        if clean and clean.lower() not in seen:
+            output.append(clean)
+            seen.add(clean.lower())
+    return output
 
 def _vision_failure_pages(combined_text: str) -> list[int]:
     pages: list[int] = []
@@ -1430,9 +1480,53 @@ def build_diligence_requests(
     for item in _as_list(next_steps.get("due_diligence_priorities")):
         add("diligence", str(item), "medium", "scored.next_steps.due_diligence_priorities")
 
+    missing_text = " ".join(str(field).lower() for field in missing_fields)
+    grouped_missing_requests = [
+        (
+            ["latest_week_occupancy", "avg_4wk", "avg_13wk", "monthly_avg", "fy23_avg", "fy24_avg", "fy25_avg", "occupancy_history", "occupancy"],
+            "occupancy",
+            "Upload occupancy/utilisation export covering FY23, FY24, and the latest 13 weeks, preferably weekly and room-level.",
+            "high",
+        ),
+        (
+            ["lease_expiry", "lease_commencement", "lease_term", "lease", "rent_review", "make_good"],
+            "lease",
+            "Upload executed lease and any variations/options schedule confirming commencement, expiry, options, rent review, assignment, and make-good obligations.",
+            "high",
+        ),
+        (
+            ["normalised_ebitda", "normalized_ebitda", "addback", "add_back"],
+            "financials",
+            "Upload add-back / normalisation schedule showing owner salary, one-off costs, related-party expenses, and accepted/rejected adjustments.",
+            "high",
+        ),
+        (
+            ["payroll", "labour", "labor", "wages", "employment_cost"],
+            "financials",
+            "Upload payroll report or worked-hours export matching the revenue period to verify wages and staffing coverage.",
+            "high",
+        ),
+        (
+            ["asking_price", "price_guide", "purchase_price"],
+            "valuation",
+            "Confirm asking price or price guide.",
+            "medium",
+        ),
+    ]
+    matched_fields: set[str] = set()
+    for markers, category, request, priority in grouped_missing_requests:
+        linked = [str(field) for field in missing_fields if any(marker in str(field).lower() for marker in markers)]
+        if linked or any(marker in missing_text for marker in markers):
+            add(category, request, priority, "missing_fields_grouped", linked)
+            matched_fields.update(linked)
     for field in missing_fields[:12]:
+        if str(field) in matched_fields:
+            continue
         label = str(field).replace("_", " ")
-        add("missing_field", f"Provide evidence for missing field: {label}.", "medium", "missing_fields", [str(field)])
+        if re.search(r"^[a-z0-9_]+$", str(field)) and "_" in str(field):
+            add("missing_field", f"Upload source document or schedule supporting {label}.", "medium", "missing_fields", [str(field)])
+        else:
+            add("missing_field", str(field), "medium", "missing_fields", [str(field)])
     for fact in facts:
         if fact.get("next_action"):
             add("evidence_action", str(fact["next_action"]), "medium", "evidence_ledger", [str(fact.get("field"))])
@@ -1767,6 +1861,182 @@ def build_evidence_readiness(facts: list[dict[str, Any]]) -> dict[str, list[dict
     return groups
 
 
+def _canonical_fact_score(fact: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    use = str(fact.get("underwriting_use") or "")
+    quality = str(fact.get("source_quality") or "unknown")
+    trust = str(fact.get("trust") or "unknown")
+    period = _as_dict(fact.get("period"))
+    coverage = str(period.get("coverage_status") or "")
+    coverage_rank = {"complete": 3, "not_applicable": 2, "partial": 1, "unknown": 0}.get(coverage, 0)
+    has_value = 1 if _present(fact.get("value")) or _present(fact.get("normalized_value")) else 0
+    return (
+        UNDERWRITING_USE_RANK.get(use, 0),
+        SOURCE_QUALITY_RANK.get(quality, 1),
+        TRUST_RANK.get(trust, 2),
+        coverage_rank,
+        has_value,
+    )
+
+
+def _canonical_summary(fact: dict[str, Any], status: str | None = None, conflicts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {
+        "fact_id": fact.get("id"),
+        "field": fact.get("field"),
+        "label": fact.get("label"),
+        "value": fact.get("value"),
+        "normalized_value": fact.get("normalized_value"),
+        "unit": fact.get("unit"),
+        "provenance": fact.get("provenance"),
+        "trust": "disputed" if status == "conflicting" else fact.get("trust"),
+        "underwriting_use": fact.get("underwriting_use"),
+        "source_type": fact.get("source_type"),
+        "source_quality": fact.get("source_quality"),
+        "period": fact.get("period"),
+        "source_refs": fact.get("source_refs") or [],
+        "derivation_formula": fact.get("derivation_formula"),
+        "derivation_recipe": fact.get("derivation_recipe"),
+        "reason": fact.get("reason"),
+        "next_action": fact.get("next_action"),
+        "status": status or fact.get("underwriting_use") or fact.get("provenance"),
+        "conflicts": conflicts or fact.get("conflicts") or [],
+    }
+
+
+def build_canonical_facts(facts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    canonical: dict[str, dict[str, Any]] = {}
+    for canonical_field, aliases in CANONICAL_FIELD_ALIASES.items():
+        candidates = [
+            fact for fact in facts
+            if str(fact.get("field")) in aliases and fact.get("provenance") != "missing"
+        ]
+        if not candidates:
+            continue
+        non_excluded = [fact for fact in candidates if fact.get("underwriting_use") != "excluded"]
+        selectable = non_excluded or candidates
+        sorted_candidates = sorted(selectable, key=_canonical_fact_score, reverse=True)
+        selected = sorted_candidates[0]
+        conflict_candidates = [
+            fact for fact in selectable
+            if fact is not selected
+            and _present(fact.get("value"))
+            and _present(selected.get("value"))
+            and str(fact.get("value")) != str(selected.get("value"))
+        ]
+        has_dispute = selected.get("trust") == "disputed" or any(f.get("trust") == "disputed" for f in selectable) or bool(conflict_candidates)
+        conflicts = []
+        for fact in conflict_candidates[:8]:
+            conflicts.append({
+                "fact_id": fact.get("id"),
+                "value": fact.get("value"),
+                "source_ref": (fact.get("source_refs") or [{}])[0],
+                "source_type": fact.get("source_type"),
+                "source_quality": fact.get("source_quality"),
+                "trust": fact.get("trust"),
+                "reason": fact.get("reason") or "Alternate source value differs from selected canonical fact.",
+            })
+        status = "conflicting" if has_dispute else None
+        canonical[canonical_field] = _canonical_summary(selected, status, conflicts)
+    return canonical
+
+
+def build_valuation_gate_summary(valuation_gate: dict[str, Any], canonical_facts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    field_map = {
+        "revenue": ("Revenue", ["revenue"]),
+        "ebitda": ("EBITDA / operating profit", ["ebitda", "normalised_ebitda"]),
+        "payroll_labour_cost": ("Payroll / labour cost", ["payroll_labour_cost"]),
+        "occupancy_history": ("Occupancy history", ["avg_13wk_occupancy", "avg_4wk_occupancy", "current_occupancy"]),
+    }
+    blocker_by_field = {
+        str(blocker.get("field")): blocker
+        for blocker in _as_list(valuation_gate.get("blockers"))
+        if isinstance(blocker, dict)
+    }
+    rows: list[dict[str, Any]] = []
+    for gate_field, (label, canonical_keys) in field_map.items():
+        fact = next((canonical_facts.get(key) for key in canonical_keys if canonical_facts.get(key)), None)
+        blocker = blocker_by_field.get(gate_field)
+        observed = bool(fact and fact.get("provenance") != "missing")
+        use = str(fact.get("underwriting_use") if fact else blocker.get("underwriting_use") if blocker else "blocked")
+        if fact and fact.get("status") == "conflicting":
+            use = "review_required"
+        if blocker:
+            use = str(blocker.get("underwriting_use") or use or "blocked")
+        evidence_status = "found" if observed else "missing"
+        rows.append({
+            "field": gate_field,
+            "label": label,
+            "evidence": evidence_status,
+            "underwriting_use": use or "blocked",
+            "value": fact.get("value") if fact else None,
+            "unit": fact.get("unit") if fact else None,
+            "trust": "disputed" if fact and fact.get("status") == "conflicting" else fact.get("trust") if fact else "unknown",
+            "source_quality": fact.get("source_quality") if fact else "unknown",
+            "period": fact.get("period") if fact else None,
+            "reason": (
+                blocker.get("reason") if blocker else
+                fact.get("reason") if fact else
+                "No credible evidence found for this underwriting input."
+            ),
+            "next_action": blocker.get("required_evidence") if blocker else fact.get("next_action") if fact else None,
+            "fact_id": fact.get("fact_id") if fact else None,
+        })
+    return {
+        "status": valuation_gate.get("status"),
+        "valuation_label": valuation_gate.get("valuation_label"),
+        "can_show_confident_valuation": valuation_gate.get("can_show_confident_valuation"),
+        "rows": rows,
+    }
+
+
+def build_evidence_quality_summary(
+    facts: list[dict[str, Any]],
+    valuation_gate: dict[str, Any],
+    canonical_facts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    key_facts = [
+        canonical_facts.get("revenue"),
+        canonical_facts.get("ebitda") or canonical_facts.get("normalised_ebitda"),
+        canonical_facts.get("payroll_labour_cost"),
+        canonical_facts.get("rent"),
+        canonical_facts.get("avg_13wk_occupancy") or canonical_facts.get("avg_4wk_occupancy") or canonical_facts.get("current_occupancy"),
+    ]
+    key_facts = [fact for fact in key_facts if fact]
+    uses = {str(fact.get("underwriting_use")) for fact in key_facts}
+    trusts = {str(fact.get("trust")) for fact in key_facts}
+    if valuation_gate.get("status") == "blocked" or "blocked" in uses:
+        underwriting_reliability = "Blocked"
+    elif "review_required" in uses or "disputed" in trusts or valuation_gate.get("status") == "needs_review":
+        underwriting_reliability = "Review required"
+    elif key_facts and all(fact.get("underwriting_use") == "accepted" for fact in key_facts):
+        underwriting_reliability = "Accepted"
+    else:
+        underwriting_reliability = "Review required"
+
+    if underwriting_reliability == "Accepted" and all(
+        fact.get("trust") == "high" and fact.get("source_quality") == "authoritative"
+        for fact in key_facts
+    ):
+        evidence_quality = "High"
+    elif key_facts:
+        evidence_quality = "Mixed"
+    else:
+        evidence_quality = "Low"
+
+    extracted_count = len([fact for fact in facts if fact.get("provenance") in {"found", "derived"} and _present(fact.get("value"))])
+    missing_count = len([fact for fact in facts if fact.get("provenance") == "missing"])
+    extraction_completeness = "High" if extracted_count >= 6 and missing_count <= 2 else "Medium" if extracted_count >= 3 else "Low"
+    return {
+        "evidence_quality": evidence_quality,
+        "underwriting_reliability": underwriting_reliability,
+        "extraction_completeness": extraction_completeness,
+        "reason": (
+            "Key underwriting facts are accepted and authoritative."
+            if underwriting_reliability == "Accepted"
+            else "One or more key underwriting facts are missing, disputed, excluded, or require review."
+        ),
+    }
+
+
 def build_structured_deal_intelligence(
     extracted: dict[str, Any],
     scored: dict[str, Any],
@@ -1789,6 +2059,9 @@ def build_structured_deal_intelligence(
             if "occupancy_history" not in str(field).lower()
             and "occupancy history" not in str(field).lower()
         ]
+    canonical_facts = build_canonical_facts(extracted_facts)
+    valuation_gate_summary = build_valuation_gate_summary(valuation_gate, canonical_facts)
+    evidence_quality = build_evidence_quality_summary(extracted_facts, valuation_gate, canonical_facts)
     risks = build_risks(extracted, scored, valuation_gate)
     diligence_requests = build_diligence_requests(scored, missing_fields, valuation_gate, extracted_facts)
     extraction_warnings = []
@@ -1874,11 +2147,14 @@ def build_structured_deal_intelligence(
         "missing_fields": missing_fields,
         "risks": risks,
         "valuation_gate": valuation_gate,
+        "valuation_gate_summary": valuation_gate_summary,
         "diligence_checklist": diligence_requests,
         "diligence_requests": diligence_requests,
         "extraction_warnings": extraction_warnings,
         "evidence": evidence,
         "evidence_ledger": extracted_facts,
+        "canonical_facts": canonical_facts,
+        "evidence_quality": evidence_quality,
         "evidence_readiness": build_evidence_readiness(extracted_facts),
         "partner_judgement_prompts": PARTNER_JUDGEMENT_PROMPTS,
         "narrative_guard": narrative_guard,
