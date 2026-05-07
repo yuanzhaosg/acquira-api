@@ -281,9 +281,16 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertEqual(fields["normalised_ebitda"]["value"], 210000)
         self.assertEqual(fields["avg_4wk_occupancy_pct"]["value"], 85)
         self.assertEqual(fields["revenue"]["source_type"], "workbook_derived")
+        self.assertEqual(fields["revenue"]["provenance"], "derived")
+        self.assertEqual(fields["revenue"]["underwriting_use"], "review_required")
+        self.assertIn(fields["revenue"]["trust"], {"medium", "disputed"})
         self.assertEqual(fields["revenue"]["source"]["cell_range"], "D23:F23")
         self.assertIn("Derived from workbook digest", fields["revenue"]["derivation_note"])
+        self.assertIn("derivation_recipe", fields["avg_4wk_occupancy_pct"])
+        self.assertIn("evidence_readiness", workflow)
+        self.assertTrue(workflow["evidence_readiness"]["derived"])
         self.assertEqual(workflow["valuation_gate"]["required_evidence"]["occupancy_history"], True)
+        self.assertEqual(workflow["valuation_gate"]["status"], "needs_review")
         self.assertNotIn("occupancy_history", [str(field).lower() for field in workflow["missing_fields"]])
 
     def test_workbook_derived_financials_prefer_workbook_and_flag_conflict(self):
@@ -310,6 +317,9 @@ class DocumentExtractionTests(unittest.TestCase):
 
         fields = {fact["field"]: fact for fact in workflow["facts"]}
         self.assertEqual(fields["revenue"]["value"], 1200000)
+        self.assertEqual(fields["revenue"]["trust"], "disputed")
+        self.assertEqual(fields["revenue"]["underwriting_use"], "review_required")
+        self.assertTrue(fields["revenue"]["conflicts"])
         self.assertEqual(fields["payroll_labour_cost"]["value"], 620000)
         self.assertTrue(any(warning["id"] == "workbook_financial_conflicts" for warning in workflow["extraction_warnings"]))
 
@@ -342,6 +352,8 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertEqual(fields["address"]["source"]["page"], 2)
         self.assertEqual(fields["suburb"]["value"], "Norlane")
         self.assertEqual(fields["postcode"]["value"], "3214")
+        self.assertEqual(fields["postcode"]["provenance"], "found")
+        self.assertEqual(fields["postcode"]["source_type"], "supplemental_doc")
         self.assertNotIn("postcode", [str(field).lower() for field in workflow["missing_fields"]])
 
     def test_manual_evidence_notes_are_low_confidence_and_redacted(self):
@@ -362,6 +374,36 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertNotIn("sk-ant-secret", text)
         self.assertIn("[redacted_api_key]", text)
         self.assertIn("Do not silently override source-backed document values", text)
+
+    def test_manual_context_fact_is_low_trust_review_context(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["note"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000, "total_labour_cost": 550000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== Manual diligence notes (manual_user_note) ===\n"
+                "--- Manual Evidence 1 ---\n"
+                "SOURCE_TYPE: manual_user_note\n"
+                "STATUS: received\n"
+                "QUESTION: Director retention\n"
+                "NOTES: Vendor says the director will stay after settlement.\n"
+            ),
+            source_files=["Manual diligence notes"],
+            file_classes={"Manual diligence notes": "manual_user_note"},
+        )
+
+        manual = [fact for fact in workflow["facts"] if fact["provenance"] == "manual_context"]
+        self.assertTrue(manual)
+        self.assertEqual(manual[0]["trust"], "low")
+        self.assertEqual(manual[0]["underwriting_use"], "review_required")
+        self.assertTrue(workflow["evidence_readiness"]["manual_context"])
+        self.assertTrue(workflow["partner_judgement_prompts"])
 
 
 if __name__ == "__main__":

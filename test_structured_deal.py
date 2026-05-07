@@ -187,7 +187,8 @@ class StructuredDealTests(unittest.TestCase):
 
         guard = result["narrative_guard"]
         self.assertIn("recommendation", guard)
-        self.assertTrue(guard["can_use_legacy_valuation_language"])
+        self.assertFalse(guard["can_use_legacy_valuation_language"])
+        self.assertEqual(result["valuation_gate"]["status"], "needs_review")
 
     def test_fee_facts_are_extracted_from_daily_and_weekly_fee_text(self):
         text = """

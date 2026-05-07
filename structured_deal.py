@@ -8,6 +8,9 @@ from narrative_guard import build_narrative_guard
 BLOCKED_VALUATION_MESSAGE = (
     "Valuation unavailable until P&L, payroll, and occupancy history are verified."
 )
+EXTRACTOR_VERSION = "document-extraction-hardening-20260507"
+PROMPT_VERSION = "extraction-system-v20260507"
+VALUATION_REQUIRED_FIELDS = {"revenue", "ebitda", "normalised_ebitda", "payroll_labour_cost", "rent_pa", "avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "latest_week_occupancy_pct"}
 
 
 def _present(value: Any) -> bool:
@@ -107,6 +110,137 @@ def _confidence(value: Any, data_quality: str | None = None) -> str:
     return "medium"
 
 
+def _source_quality(source_label: str, extraction_method: str) -> str:
+    text = f"{source_label} {extraction_method}".lower()
+    if "manual_user_note" in text:
+        return "manual"
+    if re.search(r"\b(template|forecast|budget|model|pro[-\s]?forma|scenario|assumption)\b", text):
+        return "template_or_forecast"
+    if extraction_method.startswith("excel_digest:derived"):
+        return "authoritative"
+    if re.search(r"\b(adjusted actuals|actuals|myob|xero|management accounts|profit and loss|p&l|pay run|payroll|workedhours|employment hero|utilisation|utilization|occupancy|xplor|lease|rent ledger|service approval|nqs)\b", text):
+        return "authoritative"
+    if re.search(r"\b(im_pdf|im_docx|information memorandum|broker|brochure|teaser|summary)\b", text):
+        return "broker_summary"
+    if re.search(r"\b(roster|floor plan|vendor|schedule|supplemental|approval)\b", text):
+        return "supporting"
+    return "unknown"
+
+
+def _source_type(source_label: str, extraction_method: str) -> str:
+    method = (extraction_method or "").lower()
+    if method.startswith("excel_digest:derived"):
+        return "workbook_derived"
+    if method == "manual_user_note":
+        return "manual_context"
+    if "pdf_vision" in method:
+        return "pdf_vision"
+    if method.startswith("regex:supplemental_identity") or re.search(r"\b(approval|lease|nqs|service_approval)\b", f"{source_label} {method}".lower()):
+        return "supplemental_doc"
+    if "excel" in method or "workbook" in method or re.search(r"\.xlsx|\.xls|sheet:", source_label.lower()):
+        return "excel_cell"
+    if "pdf" in method:
+        return "pdf_text"
+    if method.startswith("regex:"):
+        return "pdf_text"
+    return "system_derived" if method.startswith("system") else "pdf_text"
+
+
+def _provenance(value: Any, source_type: str) -> str:
+    if not _present(value):
+        return "missing"
+    if source_type in {"workbook_derived", "system_derived", "market_model"}:
+        return "derived"
+    if source_type == "manual_context":
+        return "manual_context"
+    return "found"
+
+
+def _period_for_fact(field: str, extraction_method: str, source_quality: str) -> dict[str, Any]:
+    coverage = "not_applicable"
+    reason = None
+    if field in {"revenue", "ebitda", "normalised_ebitda", "payroll_labour_cost", "rent_pa"}:
+        coverage = "unknown"
+        reason = "Financial period coverage was not fully established from the extracted evidence."
+        if source_quality == "template_or_forecast":
+            reason = "Template/forecast source is not accepted as actual historical period evidence."
+    if field in {"avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "avg_52wk_occupancy_pct", "latest_week_occupancy_pct"}:
+        coverage = "complete" if extraction_method.startswith("excel_digest:derived_occupancy") else "unknown"
+        reason = "Occupancy period count was derived from available utilisation rows." if coverage == "complete" else "Occupancy period coverage needs review."
+    return {
+        "coverage_status": coverage,
+        "coverage_reason": reason,
+    }
+
+
+def _derivation_recipe(field: str, extraction_method: str, excerpt: str | None) -> tuple[str | None, dict[str, Any] | None]:
+    if not extraction_method.startswith("excel_digest:derived"):
+        return None, None
+    if field == "normalised_ebitda":
+        return (
+            "Normalised EBITDA = selected normalised EBITDA/add-back row from workbook digest.",
+            {
+                "included_lines": [excerpt] if excerpt else [],
+                "excluded_lines": [],
+                "assumptions": ["Workbook normalisation row is treated as candidate evidence and needs review."],
+                "convention": "Use verified add-backs only before IC reliance.",
+                "calculation_steps": ["Locate normalised EBITDA row.", "Select the total/latest numeric value exposed by the workbook digest."],
+            },
+        )
+    if field in {"revenue", "ebitda", "payroll_labour_cost", "rent_pa"}:
+        return (
+            f"{field.replace('_', ' ')} = selected total/latest numeric row from workbook digest.",
+            {
+                "included_lines": [excerpt] if excerpt else [],
+                "excluded_lines": [],
+                "assumptions": ["Workbook row label is treated as the evidence convention; verify period coverage."],
+                "convention": "Prefer actuals/management-account tabs over broker summaries.",
+                "calculation_steps": ["Find labelled workbook row.", "Use the total/latest numeric value from the row."],
+            },
+        )
+    if field.startswith("avg_"):
+        weeks = "13" if "13" in field else "4" if "4" in field else "52"
+        return (
+            f"{weeks}-week occupancy average = average of latest {weeks} occupancy observations.",
+            {
+                "included_lines": [excerpt] if excerpt else [],
+                "excluded_lines": [],
+                "assumptions": ["Values are interpreted as utilisation/occupancy percentages."],
+                "convention": "Use weekly observations from occupancy/utilisation exports where available.",
+                "calculation_steps": [f"Collect latest {weeks} occupancy observations.", "Average observations."],
+            },
+        )
+    return None, None
+
+
+def _trust(value: Any, confidence: str, source_quality: str, provenance: str, conflicts: list[dict[str, Any]] | None = None) -> str:
+    if not _present(value):
+        return "unknown"
+    if conflicts:
+        return "disputed"
+    if source_quality in {"manual", "template_or_forecast"} or provenance == "manual_context":
+        return "low"
+    if confidence == "high" and source_quality == "authoritative":
+        return "high"
+    if source_quality == "unknown":
+        return "unknown"
+    return "medium"
+
+
+def _underwriting_use(field: str, provenance: str, trust: str, source_quality: str, value: Any) -> str:
+    if not _present(value):
+        return "blocked" if field in VALUATION_REQUIRED_FIELDS else "excluded"
+    if source_quality == "template_or_forecast":
+        return "excluded"
+    if provenance == "manual_context":
+        return "review_required"
+    if trust == "high":
+        return "accepted"
+    if trust in {"medium", "low", "disputed", "unknown"}:
+        return "review_required"
+    return "blocked"
+
+
 FIELD_META: dict[str, dict[str, str | None]] = {
     "centre_name": {"category": "centre", "label": "Centre name", "unit": None},
     "trading_name": {"category": "centre", "label": "Trading name", "unit": None},
@@ -167,6 +301,7 @@ def _add_fact(
     blocker: bool = False,
     label_override: str | None = None,
     cell_range: str | None = None,
+    conflicts: list[dict[str, Any]] | None = None,
 ) -> None:
     evidence_id = f"ev_{_stable_token(field, source_label, page, excerpt, value)}"
     fact_id = f"fact_{_stable_token(field, value, evidence_id)}"
@@ -181,12 +316,33 @@ def _add_fact(
     }
     if cell_range:
         source["cell_range"] = cell_range
-    source_type = "workbook_derived" if extraction_method.startswith("excel_digest:derived") else (
-        "manual_user_note" if extraction_method == "manual_user_note" else "source_document"
-    )
-    derivation_note = None
-    if source_type == "workbook_derived":
-        derivation_note = "Derived from workbook digest rows/cells; review against the original spreadsheet before IC reliance."
+    source_type = _source_type(source_label, extraction_method)
+    source_quality = _source_quality(source_label, extraction_method)
+    provenance = _provenance(value, source_type)
+    trust = _trust(value, confidence, source_quality, provenance, conflicts)
+    underwriting_use = _underwriting_use(field, provenance, trust, source_quality, value)
+    derivation_formula, derivation_recipe = _derivation_recipe(field, extraction_method, excerpt)
+    derivation_note = "Derived from workbook digest rows/cells; review against the original spreadsheet before IC reliance." if provenance == "derived" else None
+    period = _period_for_fact(field, extraction_method, source_quality)
+    source_ref = {
+        "file_name": source_label,
+        "page": page,
+        "cell_range": cell_range,
+        "extraction_method": extraction_method,
+        "excerpt": excerpt,
+        "extractor_version": EXTRACTOR_VERSION,
+        "prompt_version": PROMPT_VERSION,
+    }
+    reason = None
+    next_action = None
+    if underwriting_use == "excluded":
+        reason = "Observed evidence is not suitable for underwriting use."
+    elif underwriting_use == "review_required":
+        reason = "Evidence exists, but source quality, extraction certainty, coverage, or conflicts require review."
+    if trust == "disputed":
+        next_action = "Resolve conflicting source values before relying on this field."
+    elif field == "avg_13wk_occupancy_pct" and underwriting_use == "blocked":
+        next_action = "Upload occupancy/utilisation export covering at least 13 weeks."
     facts.append({
         "id": fact_id,
         "field": field,
@@ -202,7 +358,20 @@ def _add_fact(
         "blocker": blocker,
         "extraction_method": extraction_method,
         "source_type": source_type,
+        "source_quality": source_quality,
+        "provenance": provenance,
+        "trust": trust,
+        "underwriting_use": underwriting_use,
+        "period": period,
+        "source_refs": [source_ref],
         "derivation_note": derivation_note,
+        "derivation_formula": derivation_formula,
+        "derivation_recipe": derivation_recipe,
+        "conflicts": conflicts or [],
+        "reason": reason,
+        "next_action": next_action,
+        "extractor_version": EXTRACTOR_VERSION,
+        "prompt_version": PROMPT_VERSION,
         "evidence_id": evidence_id,
     })
     evidence.append({
@@ -215,7 +384,14 @@ def _add_fact(
         "confidence": confidence,
         "extraction_method": extraction_method,
         "source_type": source_type,
+        "source_quality": source_quality,
+        "provenance": provenance,
+        "trust": trust,
+        "underwriting_use": underwriting_use,
         "derivation_note": derivation_note,
+        "derivation_formula": derivation_formula,
+        "derivation_recipe": derivation_recipe,
+        "source_refs": [source_ref],
     })
     if source.get("cell_range"):
         evidence[-1]["cell_range"] = source.get("cell_range")
@@ -761,6 +937,32 @@ def extract_identity_facts_from_text(combined_text: str) -> list[dict[str, Any]]
     return facts
 
 
+def extract_manual_context_facts_from_text(combined_text: str) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    pattern = re.compile(r"--- Manual Evidence \d+ ---\n([\s\S]*?)(?=\n--- Manual Evidence \d+ ---|\Z)", re.IGNORECASE)
+    for idx, match in enumerate(pattern.finditer(combined_text or ""), start=1):
+        block = match.group(1)
+        note_match = re.search(r"NOTES:\s*(.*)", block)
+        status_match = re.search(r"STATUS:\s*(.*)", block)
+        question_match = re.search(r"QUESTION:\s*(.*)", block)
+        value = (note_match.group(1).strip() if note_match else "") or (status_match.group(1).strip() if status_match else "")
+        if not value:
+            continue
+        label = "Manual diligence context"
+        question = question_match.group(1).strip() if question_match else ""
+        facts.append({
+            "field": f"manual_context_{idx}",
+            "value": value[:500],
+            "source_label": "Manual diligence notes",
+            "page": None,
+            "confidence": "low",
+            "extraction_method": "manual_user_note",
+            "excerpt": block.strip()[:500],
+            "label": label if not question else f"{label}: {question[:80]}",
+        })
+    return facts
+
+
 def extract_missing_field_support_from_text(combined_text: str) -> list[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
     patterns = [
@@ -827,49 +1029,90 @@ def _has_occupancy_history(extracted: dict[str, Any], combined_text: str | None 
     return _text_has_occupancy_history(combined_text or "") if combined_text else False
 
 
-def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = None) -> dict[str, Any]:
-    fy25 = _as_dict(_get(extracted, "financials", "fy25"))
-    ratios = _as_dict(extracted.get("key_ratios"))
+def _best_fact_for_gate(facts: list[dict[str, Any]], fields: list[str]) -> dict[str, Any] | None:
+    candidates = [
+        fact for fact in facts
+        if fact.get("field") in fields and _present(fact.get("value"))
+    ]
+    if not candidates:
+        return None
+    order = {"accepted": 0, "review_required": 1, "blocked": 2, "excluded": 3}
+    return sorted(candidates, key=lambda fact: order.get(str(fact.get("underwriting_use")), 9))[0]
 
-    revenue = fy25.get("revenue") or ratios.get("revenue_fy25")
-    ebitda = fy25.get("ebitda") or fy25.get("normalised_ebitda") or ratios.get("ebitda_fy25") or ratios.get("ebitda_3yr_avg")
-    labour = fy25.get("total_labour_cost")
-    occupancy_history = _has_occupancy_history(extracted, combined_text)
+
+def _gate_support(facts: list[dict[str, Any]], fields: list[str]) -> tuple[bool, bool, dict[str, Any] | None]:
+    fact = _best_fact_for_gate(facts, fields)
+    if not fact:
+        return False, False, None
+    use = fact.get("underwriting_use")
+    if use == "accepted":
+        return True, False, fact
+    if use == "review_required":
+        return True, True, fact
+    return False, False, fact
+
+
+def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = None, extracted_facts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    facts = extracted_facts or []
+    revenue_supported, revenue_review, revenue_fact = _gate_support(facts, ["revenue"])
+    ebitda_supported, ebitda_review, ebitda_fact = _gate_support(facts, ["ebitda", "normalised_ebitda"])
+    labour_supported, labour_review, labour_fact = _gate_support(facts, ["payroll_labour_cost"])
+    occupancy_supported, occupancy_review, occupancy_fact = _gate_support(facts, ["avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "avg_52wk_occupancy_pct", "latest_week_occupancy_pct"])
+    if not facts:
+        fy25 = _as_dict(_get(extracted, "financials", "fy25"))
+        ratios = _as_dict(extracted.get("key_ratios"))
+        revenue_supported = _present(fy25.get("revenue") or ratios.get("revenue_fy25"))
+        ebitda_supported = _present(fy25.get("ebitda") or fy25.get("normalised_ebitda") or ratios.get("ebitda_fy25") or ratios.get("ebitda_3yr_avg"))
+        labour_supported = _present(fy25.get("total_labour_cost"))
+        occupancy_supported = _has_occupancy_history(extracted, combined_text)
+        revenue_review = ebitda_review = labour_review = occupancy_review = False
 
     required = {
-        "revenue": _present(revenue),
-        "ebitda": _present(ebitda),
-        "payroll_labour_cost": _present(labour),
-        "occupancy_history": occupancy_history,
+        "revenue": revenue_supported,
+        "ebitda": ebitda_supported,
+        "payroll_labour_cost": labour_supported,
+        "occupancy_history": occupancy_supported,
     }
 
     blockers = []
     if not required["revenue"]:
         blockers.append({
             "field": "revenue",
-            "reason": "Revenue missing",
+            "reason": "Revenue unavailable for underwriting",
             "required_evidence": "P&L or management accounts showing revenue.",
+            "underwriting_use": revenue_fact.get("underwriting_use") if revenue_fact else "blocked",
         })
     if not required["ebitda"]:
         blockers.append({
             "field": "ebitda",
-            "reason": "EBITDA missing",
+            "reason": "EBITDA unavailable for underwriting",
             "required_evidence": "P&L or normalised EBITDA bridge.",
+            "underwriting_use": ebitda_fact.get("underwriting_use") if ebitda_fact else "blocked",
         })
     if not required["payroll_labour_cost"]:
         blockers.append({
             "field": "payroll_labour_cost",
-            "reason": "Payroll/labour cost missing",
+            "reason": "Payroll/labour cost unavailable for underwriting",
             "required_evidence": "Payroll summary or P&L labour cost detail.",
+            "underwriting_use": labour_fact.get("underwriting_use") if labour_fact else "blocked",
         })
 
     warnings = []
-    if not occupancy_history:
+    if not occupancy_supported:
         blockers.append({
             "field": "occupancy_history",
-            "reason": "Occupancy history missing",
+            "reason": "Occupancy history unavailable for underwriting",
             "required_evidence": "Weekly or monthly occupancy history, preferably 4-week and 13-week averages.",
+            "underwriting_use": occupancy_fact.get("underwriting_use") if occupancy_fact else "blocked",
         })
+    for field, needs_review, fact in [
+        ("revenue", revenue_review, revenue_fact),
+        ("ebitda", ebitda_review, ebitda_fact),
+        ("payroll_labour_cost", labour_review, labour_fact),
+        ("occupancy_history", occupancy_review, occupancy_fact),
+    ]:
+        if needs_review:
+            warnings.append(f"{field.replace('_', ' ')} is available but requires review before confident valuation.")
 
     if blockers:
         return {
@@ -886,8 +1129,8 @@ def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = 
     if warnings:
         return {
             "status": "needs_review",
-            "reason": "Occupancy history not verified",
-            "message": "Valuation may be shown as illustrative only until occupancy history is verified.",
+            "reason": "Required evidence exists but needs review",
+            "message": "Guarded valuation may be shown, but one or more required facts need partner review before IC reliance.",
             "valuation_label": "illustrative_only",
             "can_show_confident_valuation": False,
             "required_evidence": required,
@@ -1053,6 +1296,9 @@ def build_diligence_requests(
     for field in missing_fields[:12]:
         label = str(field).replace("_", " ")
         add("missing_field", f"Provide evidence for missing field: {label}.", "medium", "missing_fields", [str(field)])
+    for fact in facts:
+        if fact.get("next_action"):
+            add("evidence_action", str(fact["next_action"]), "medium", "evidence_ledger", [str(fact.get("field"))])
     return requests
 
 
@@ -1069,6 +1315,7 @@ def build_extracted_facts(
     support_text_facts = extract_missing_field_support_from_text(combined_text)
     financial_text_facts = extract_financial_facts_from_text(combined_text)
     identity_text_facts = extract_identity_facts_from_text(combined_text)
+    manual_text_facts = extract_manual_context_facts_from_text(combined_text)
     text_fact_by_field: dict[str, dict[str, Any]] = {}
     for fact in [*occupancy_text_facts, *support_text_facts, *financial_text_facts, *identity_text_facts]:
         text_fact_by_field.setdefault(fact["field"], fact)
@@ -1154,6 +1401,18 @@ def build_extracted_facts(
         ("asking_price", _get(extracted, "financials", "asking_price") or _get(extracted, "key_ratios", "asking_price"), "extracted_json"),
         ("lease_expiry", _get(extracted, "lease", "expiry_date"), "extracted_json"),
     ]
+    conflicts_by_field: dict[str, list[dict[str, Any]]] = {}
+    for conflict in _as_list(_get(extracted, "meta", "workbook_derived_conflicts")):
+        if isinstance(conflict, dict):
+            conflicts_by_field.setdefault(str(conflict.get("field")), []).append({
+                "value": conflict.get("existing_value"),
+                "source_ref": {
+                    "file_name": "prior extracted value",
+                    "extraction_method": "extracted_json",
+                    "excerpt": conflict.get("excerpt"),
+                },
+                "reason": "Existing value differed from workbook-derived evidence.",
+            })
 
     for field, value, method in field_specs:
         hint = text_fact_by_field.get(field) or _find_source_hint(field, value, combined_text)
@@ -1172,6 +1431,21 @@ def build_extracted_facts(
             blocker=field in {"revenue", "ebitda", "payroll_labour_cost"} and confidence == "missing",
             label_override=hint.get("label"),
             cell_range=hint.get("cell_range"),
+            conflicts=conflicts_by_field.get(field),
+        )
+
+    for manual in manual_text_facts:
+        _add_fact(
+            facts,
+            manual["field"],
+            manual["value"],
+            manual["source_label"],
+            manual["confidence"],
+            manual["extraction_method"],
+            evidence,
+            manual.get("excerpt"),
+            page=manual.get("page"),
+            label_override=manual.get("label"),
         )
 
     fee_facts = extract_fee_facts_from_text(combined_text)
@@ -1260,6 +1534,98 @@ def remove_fee_missing_markers(extracted: dict[str, Any], fee_facts: list[dict[s
     meta["missing_fields_count"] = len(meta["missing_fields"])
 
 
+PARTNER_JUDGEMENT_PROMPTS = [
+    {
+        "id": "vendor_motivation",
+        "question": "Why is the vendor selling?",
+        "why_it_matters": "Vendor motivation shapes price tension, retention risk, and deal structure.",
+        "category": "seller_context",
+    },
+    {
+        "id": "landlord_relationship",
+        "question": "Is the vendor related to the landlord/freeholder?",
+        "why_it_matters": "Related-party rent may distort maintainable earnings and lease risk.",
+        "category": "property",
+    },
+    {
+        "id": "director_retention",
+        "question": "Is the director staying post-sale?",
+        "why_it_matters": "Director retention can materially affect continuity, occupancy, and staff stability.",
+        "category": "staffing",
+    },
+    {
+        "id": "key_staff_retention",
+        "question": "Are key staff expected to remain?",
+        "why_it_matters": "Staff retention is buyer judgement, not usually solved by document extraction.",
+        "category": "staffing",
+    },
+    {
+        "id": "regulatory_history",
+        "question": "Any pending NQS reassessment, CCS audit, pause, or compliance issue in the last 24 months?",
+        "why_it_matters": "Regulatory downside can override attractive financial metrics.",
+        "category": "regulatory",
+    },
+    {
+        "id": "local_pipeline",
+        "question": "Any unlisted nearby competitors or DA/pipeline projects?",
+        "why_it_matters": "Local intelligence can change supply-demand conclusions.",
+        "category": "market",
+    },
+    {
+        "id": "freehold_option",
+        "question": "Is freehold available now or later?",
+        "why_it_matters": "Freehold optionality can change strategy, capital structure, and lease risk.",
+        "category": "property",
+    },
+    {
+        "id": "related_party_adjustments",
+        "question": "Any related-party expenses, rent adjustments, or owner salary normalisations?",
+        "why_it_matters": "These determine whether normalised EBITDA is acceptable.",
+        "category": "financials",
+    },
+]
+
+
+def build_evidence_readiness(facts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups = {
+        "accepted": [],
+        "review_required": [],
+        "disputed": [],
+        "blocked": [],
+        "excluded": [],
+        "missing": [],
+        "manual_context": [],
+        "derived": [],
+    }
+    for fact in facts:
+        summary = {
+            "fact_id": fact.get("id"),
+            "field": fact.get("field"),
+            "label": fact.get("label"),
+            "value": fact.get("value"),
+            "provenance": fact.get("provenance"),
+            "trust": fact.get("trust"),
+            "underwriting_use": fact.get("underwriting_use"),
+            "source_type": fact.get("source_type"),
+            "source_quality": fact.get("source_quality"),
+            "reason": fact.get("reason"),
+            "next_action": fact.get("next_action"),
+            "source_refs": fact.get("source_refs") or [],
+        }
+        if fact.get("provenance") == "manual_context":
+            groups["manual_context"].append(summary)
+        if fact.get("provenance") == "derived":
+            groups["derived"].append(summary)
+        if fact.get("trust") == "disputed":
+            groups["disputed"].append(summary)
+        use = str(fact.get("underwriting_use") or "")
+        if use in groups:
+            groups[use].append(summary)
+        if fact.get("provenance") == "missing":
+            groups["missing"].append(summary)
+    return groups
+
+
 def build_structured_deal_intelligence(
     extracted: dict[str, Any],
     scored: dict[str, Any],
@@ -1275,7 +1641,7 @@ def build_structured_deal_intelligence(
     )
     remove_fee_missing_markers(extracted, fee_facts)
     missing_fields = build_missing_fields(extracted, extracted_facts)
-    valuation_gate = build_valuation_gate(extracted, combined_text)
+    valuation_gate = build_valuation_gate(extracted, combined_text, extracted_facts)
     if valuation_gate.get("required_evidence", {}).get("occupancy_history"):
         missing_fields = [
             field for field in missing_fields
@@ -1371,6 +1737,9 @@ def build_structured_deal_intelligence(
         "diligence_requests": diligence_requests,
         "extraction_warnings": extraction_warnings,
         "evidence": evidence,
+        "evidence_ledger": extracted_facts,
+        "evidence_readiness": build_evidence_readiness(extracted_facts),
+        "partner_judgement_prompts": PARTNER_JUDGEMENT_PROMPTS,
         "narrative_guard": narrative_guard,
         "market_audit": market_audit,
         "pipeline_projects": scored.get("pipeline_projects") or extracted.get("_pipeline_projects") or [],
