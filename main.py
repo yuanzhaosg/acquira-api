@@ -1597,6 +1597,9 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
         if merged_extracted.get("_pipeline_projects"):
             pipeline_intel_context += "\n\nSTRUCTURED DA / PIPELINE PROJECTS (preserved or provided):\n"
             for project in (merged_extracted.get("_pipeline_projects") or [])[:10]:
+                if not isinstance(project, dict):
+                    pipeline_intel_context += f"- {project}\n"
+                    continue
                 pipeline_intel_context += (
                     f"- {project.get('status', 'unknown')}: "
                     f"{project.get('name') or project.get('address') or 'Pipeline project'}"
@@ -2580,12 +2583,15 @@ async def pipeline(req: PipelineRequest):
                 # Also attach extracted pipeline_mentions if any
                 pipeline_mentions = extracted.get("pipeline_mentions", [])
                 if pipeline_mentions:
-                    pipeline_intel_context += f"- Document mentions: {'; '.join(pipeline_mentions)}\n"
+                    pipeline_intel_context += f"- Document mentions: {'; '.join(str(mention) for mention in pipeline_mentions)}\n"
                 # Store a flag in scored data so the front-end knows pipeline intel was used
                 extracted["_pipeline_intel_used"] = True
             if extracted.get("_pipeline_projects"):
                 pipeline_intel_context += "\n\nSTRUCTURED DA / PIPELINE PROJECTS (manual):\n"
                 for project in (extracted.get("_pipeline_projects") or [])[:10]:
+                    if not isinstance(project, dict):
+                        pipeline_intel_context += f"- {project}\n"
+                        continue
                     pipeline_intel_context += (
                         f"- {project.get('status', 'unknown')}: "
                         f"{project.get('name') or project.get('address') or 'Pipeline project'}"

@@ -14,6 +14,20 @@ def _present(value: Any) -> bool:
     return value is not None and value != "" and value != []
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    if not isinstance(parent.get(key), dict):
+        parent[key] = {}
+    return parent[key]
+
+
 def _get(data: dict[str, Any], *path: str) -> Any:
     current: Any = data
     for key in path:
@@ -23,6 +37,8 @@ def _get(data: dict[str, Any], *path: str) -> Any:
     return current
 
 def _market_audit_shell(market_audit: dict[str, Any] | None, pipeline_audit: dict[str, Any] | None) -> dict[str, Any]:
+    market_audit = _as_dict(market_audit)
+    pipeline_audit = _as_dict(pipeline_audit)
     required = {
         "catchment radius": _get(market_audit or {}, "catchment_radius_km"),
         "kids 0-4 count": _get(market_audit or {}, "kids_0_4", "value"),
@@ -40,7 +56,7 @@ def _market_audit_shell(market_audit: dict[str, Any] | None, pipeline_audit: dic
         "EDR formula and result": _get(market_audit or {}, "edr", "value"),
     }
     missing = [label for label, value in required.items() if not _present(value)]
-    audit = dict(market_audit or {})
+    audit = dict(market_audit)
     audit.setdefault("warnings", [])
     if not market_audit:
         audit["warnings"].append("Market audit inputs were not returned; render missing state and request demographic, competitor, geocode, and pipeline evidence.")
@@ -531,7 +547,7 @@ def extract_missing_field_support_from_text(combined_text: str) -> list[dict[str
 
 
 def _has_occupancy_history(extracted: dict[str, Any], combined_text: str | None = None) -> bool:
-    occupancy = extracted.get("occupancy") or {}
+    occupancy = _as_dict(extracted.get("occupancy"))
     history_fields = [
         "avg_4wk_pct",
         "avg_13wk_pct",
@@ -546,8 +562,8 @@ def _has_occupancy_history(extracted: dict[str, Any], combined_text: str | None 
 
 
 def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = None) -> dict[str, Any]:
-    fy25 = _get(extracted, "financials", "fy25") or {}
-    ratios = extracted.get("key_ratios") or {}
+    fy25 = _as_dict(_get(extracted, "financials", "fy25"))
+    ratios = _as_dict(extracted.get("key_ratios"))
 
     revenue = fy25.get("revenue") or ratios.get("revenue_fy25")
     ebitda = fy25.get("ebitda") or ratios.get("ebitda_fy25") or ratios.get("ebitda_3yr_avg")
@@ -626,10 +642,10 @@ def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = 
 
 
 def build_deal_summary(extracted: dict[str, Any], scored: dict[str, Any]) -> dict[str, Any]:
-    centre = extracted.get("centre") or {}
-    fy25 = _get(extracted, "financials", "fy25") or {}
-    ratios = extracted.get("key_ratios") or {}
-    occupancy = extracted.get("occupancy") or {}
+    centre = _as_dict(extracted.get("centre"))
+    fy25 = _as_dict(_get(extracted, "financials", "fy25"))
+    ratios = _as_dict(extracted.get("key_ratios"))
+    occupancy = _as_dict(extracted.get("occupancy"))
     return {
         "centre_name": centre.get("name") or scored.get("centre_name"),
         "address": centre.get("address"),
@@ -652,7 +668,16 @@ def build_deal_summary(extracted: dict[str, Any], scored: dict[str, Any]) -> dic
 
 def build_risks(extracted: dict[str, Any], scored: dict[str, Any], valuation_gate: dict[str, Any]) -> list[dict[str, Any]]:
     risks: list[dict[str, Any]] = []
-    for flag in extracted.get("hard_flags") or []:
+    for flag in _as_list(extracted.get("hard_flags")):
+        if not isinstance(flag, dict):
+            risks.append({
+                "id": f"hard_flag_{len(risks) + 1}",
+                "title": "Hard flag",
+                "severity": "warning",
+                "reason": str(flag),
+                "source": "extracted.hard_flags",
+            })
+            continue
         risks.append({
             "id": flag.get("id") or f"hard_flag_{len(risks) + 1}",
             "title": flag.get("id") or "Hard flag",
@@ -661,7 +686,16 @@ def build_risks(extracted: dict[str, Any], scored: dict[str, Any], valuation_gat
             "source": "extracted.hard_flags",
         })
 
-    for flag in _get(scored, "deal_breaker_flags", "flags") or []:
+    for flag in _as_list(_get(scored, "deal_breaker_flags", "flags")):
+        if not isinstance(flag, dict):
+            risks.append({
+                "id": f"deal_breaker_{len(risks) + 1}",
+                "title": "Deal-breaker flag",
+                "severity": "warning",
+                "reason": str(flag),
+                "source": "scored.deal_breaker_flags",
+            })
+            continue
         if flag.get("triggered", True):
             risks.append({
                 "id": flag.get("id") or f"deal_breaker_{len(risks) + 1}",
@@ -732,7 +766,10 @@ def build_diligence_requests(
             "linked_fields": linked_fields or [],
         })
 
-    for blocker in valuation_gate.get("blockers") or []:
+    for blocker in _as_list(valuation_gate.get("blockers")):
+        if not isinstance(blocker, dict):
+            add("financials", str(blocker), "high", "valuation_gate")
+            continue
         add(
             "financials",
             blocker.get("required_evidence") or blocker.get("reason"),
@@ -741,10 +778,10 @@ def build_diligence_requests(
             [blocker.get("field")],
         )
 
-    next_steps = scored.get("next_steps") or {}
-    for item in next_steps.get("ask_broker_for") or []:
+    next_steps = _as_dict(scored.get("next_steps"))
+    for item in _as_list(next_steps.get("ask_broker_for")):
         add("broker", str(item), "high", "scored.next_steps.ask_broker_for")
-    for item in next_steps.get("due_diligence_priorities") or []:
+    for item in _as_list(next_steps.get("due_diligence_priorities")):
         add("diligence", str(item), "medium", "scored.next_steps.due_diligence_priorities")
 
     for field in missing_fields[:12]:
@@ -768,7 +805,7 @@ def build_extracted_facts(
     for fact in [*occupancy_text_facts, *support_text_facts]:
         text_fact_by_field.setdefault(fact["field"], fact)
 
-    occupancy = extracted.setdefault("occupancy", {})
+    occupancy = _ensure_dict(extracted, "occupancy")
     if text_fact_by_field.get("current_occupancy_pct"):
         occupancy["current_month_pct"] = text_fact_by_field["current_occupancy_pct"]["value"]
     if text_fact_by_field.get("latest_week_occupancy_pct") and not _present(occupancy.get("latest_week_pct")):
@@ -780,14 +817,15 @@ def build_extracted_facts(
     if text_fact_by_field.get("avg_52wk_occupancy_pct") and not _present(occupancy.get("avg_52wk_pct")):
         occupancy["avg_52wk_pct"] = text_fact_by_field["avg_52wk_occupancy_pct"]["value"]
 
-    centre = extracted.setdefault("centre", {})
+    centre = _ensure_dict(extracted, "centre")
     if text_fact_by_field.get("licensed_places") and not _present(centre.get("licensed_places")):
         centre["licensed_places"] = text_fact_by_field["licensed_places"]["value"]
-    fy25 = extracted.setdefault("financials", {}).setdefault("fy25", {})
+    financials = _ensure_dict(extracted, "financials")
+    fy25 = _ensure_dict(financials, "fy25")
     if text_fact_by_field.get("rent_pa") and not _present(fy25.get("rent_pa")):
         fy25["rent_pa"] = text_fact_by_field["rent_pa"]["value"]
     if text_fact_by_field.get("asking_price") and not _present(_get(extracted, "financials", "asking_price")):
-        extracted.setdefault("financials", {})["asking_price"] = text_fact_by_field["asking_price"]["value"]
+        financials["asking_price"] = text_fact_by_field["asking_price"]["value"]
 
     field_specs = [
         ("centre_name", _get(extracted, "centre", "name"), "extracted_json"),
@@ -847,7 +885,8 @@ def build_extracted_facts(
 
 
 def build_missing_fields(extracted: dict[str, Any], extracted_facts: list[dict[str, Any]]) -> list[str]:
-    missing = list(_get(extracted, "meta", "missing_fields") or [])
+    raw_missing = _get(extracted, "meta", "missing_fields")
+    missing = [raw_missing] if isinstance(raw_missing, str) else list(_as_list(raw_missing))
     for fact in extracted_facts:
         if fact.get("confidence") == "missing" and fact.get("field") not in missing:
             missing.append(fact["field"])
@@ -927,7 +966,9 @@ def build_structured_deal_intelligence(
     risks = build_risks(extracted, scored, valuation_gate)
     diligence_requests = build_diligence_requests(scored, missing_fields, valuation_gate, extracted_facts)
     extraction_warnings = []
-    for blocker in valuation_gate.get("blockers") or []:
+    for blocker in _as_list(valuation_gate.get("blockers")):
+        if not isinstance(blocker, dict):
+            continue
         if blocker.get("field") == "occupancy_history":
             linked_facts = [
                 f for f in extracted_facts
@@ -971,7 +1012,7 @@ def build_structured_deal_intelligence(
         })
 
     deal_summary = build_deal_summary(extracted, scored)
-    pipeline_audit = scored.get("pipeline_audit") or extracted.get("_pipeline_audit")
+    pipeline_audit = _as_dict(scored.get("pipeline_audit") or extracted.get("_pipeline_audit"))
     market_audit = _market_audit_shell(scored.get("market_audit") or extracted.get("_market_audit"), pipeline_audit)
     narrative_guard = build_narrative_guard(
         extracted=extracted,

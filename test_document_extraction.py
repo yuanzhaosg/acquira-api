@@ -214,6 +214,36 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertTrue(any("pages 12" in message and "vision provider" in message for message in messages))
         self.assertNotIn("sk-ant", str(workflow["extraction_warnings"]))
 
+    def test_workflow_tolerates_string_items_from_excel_extraction(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["databook.xlsx"], "missing_fields": "payroll detail"},
+                "centre": "centre details not structured",
+                "financials": {"fy25": "FY25 numbers were returned as text"},
+                "occupancy": "occupancy returned as text",
+                "key_ratios": "ratios returned as text",
+                "hard_flags": ["labour costs require review"],
+                "_market_audit": "market audit unavailable",
+                "_pipeline_audit": "pipeline audit unavailable",
+            },
+            scored={
+                "centre_name": "Synthetic Childcare",
+                "deal_breaker_flags": {"flags": ["manual review required"]},
+                "next_steps": {
+                    "ask_broker_for": ["Source payroll summary"],
+                    "due_diligence_priorities": ["Verify occupancy workbook tabs"],
+                },
+            },
+            combined_text="=== databook.xlsx (pl_excel) ===\nWORKBOOK_DIGEST: databook.xlsx\nSHEET: Adjusted Actuals\nD23=Total revenue | E23=100",
+            source_files=["databook.xlsx"],
+            file_classes={"databook.xlsx": "pl_excel"},
+        )
+
+        self.assertIn("facts", workflow)
+        self.assertTrue(any(risk["reason"] == "labour costs require review" for risk in workflow["risks"]))
+        self.assertTrue(any(risk["reason"] == "manual review required" for risk in workflow["risks"]))
+        self.assertIn("payroll detail", workflow["missing_fields"])
+
 
 if __name__ == "__main__":
     unittest.main()
