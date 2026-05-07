@@ -117,7 +117,7 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertNotIn("test-key", str(diagnostics))
 
     def test_vision_401_classifies_invalid_auth_without_key_value(self):
-        error = "Error code: 401 - authentication_error invalid x-api-key for sk-ant-secret"
+        error = "Error code: 401 - authentication_error invalid x-api-key for redacted-secret"
         self.assertEqual(main.classify_vision_provider_error(error), "invalid_auth")
 
     def test_pdf_page_level_fallback_is_invoked_for_sparse_pl_page(self):
