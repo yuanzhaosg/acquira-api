@@ -995,6 +995,16 @@ class SelectedSourceDocument(BaseModel):
     run_id: Optional[str] = None
     file_size: Optional[int] = None
 
+class ManualEvidenceNote(BaseModel):
+    source_type: str = "manual_user_note"
+    source_label: Optional[str] = None
+    diligence_item_id: Optional[str] = None
+    status: Optional[str] = None
+    category: Optional[str] = None
+    question: Optional[str] = None
+    notes: Optional[str] = None
+    confidence: str = "low"
+
 class ReunderwriteRequest(BaseModel):
     deal_id: str
     run_id: str
@@ -1002,6 +1012,7 @@ class ReunderwriteRequest(BaseModel):
     base: ReunderwriteBase
     selected_diligence_documents: Optional[list[SelectedDiligenceDocument]] = None
     selected_source_documents: Optional[list[SelectedSourceDocument]] = None
+    manual_evidence_notes: Optional[list[ManualEvidenceNote]] = None
     input_document_count: Optional[int] = None
     input_total_bytes: Optional[int] = None
     pipeline_projects: Optional[list[PipelineProject]] = None
@@ -1455,6 +1466,38 @@ def declared_total_bytes(req: ReunderwriteRequest) -> int:
             total += doc.file_size
     return total
 
+
+def manual_evidence_text(notes: list[ManualEvidenceNote]) -> str:
+    def scrub(value: str) -> str:
+        return re.sub(r"sk-ant-[A-Za-z0-9_\-]+", "[redacted_api_key]", value or "")
+
+    chunks: list[str] = []
+    for idx, note in enumerate(notes[:25], start=1):
+        text = scrub((note.notes or "").strip())
+        status = scrub((note.status or "").strip())
+        question = scrub((note.question or "").strip())
+        if not text and not status:
+            continue
+        label = scrub((note.source_label or note.diligence_item_id or f"Manual evidence note {idx}").strip())
+        chunks.append(
+            "\n".join([
+                f"--- Manual Evidence {idx} ---",
+                f"SOURCE_LABEL: {label[:180]}",
+                "SOURCE_TYPE: manual_user_note",
+                f"EXTRACTION_METHOD: manual_user_note",
+                "CONFIDENCE: low",
+                f"DILIGENCE_ITEM_ID: {(note.diligence_item_id or '')[:80]}",
+                f"CATEGORY: {(note.category or '')[:80]}",
+                f"STATUS: {status[:80]}",
+                f"QUESTION: {question[:500]}",
+                f"NOTES: {text[:2000]}",
+                "WARNING: Manual notes are user-provided context. Do not silently override source-backed document values; flag conflicts for review.",
+            ])
+        )
+    if not chunks:
+        return ""
+    return "\n\n=== Manual diligence notes (manual_user_note) ===\n" + "\n\n".join(chunks)
+
 @app.post("/pipeline/reunderwrite")
 async def pipeline_reunderwrite(req: ReunderwriteRequest):
     work_dir = tempfile.mkdtemp(prefix="acquira-reunderwrite-")
@@ -1466,8 +1509,9 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             return reunderwrite_error("invalid_input", "deal_id, run_id, and base_run_id are required", 400)
         selected_diligence_documents = req.selected_diligence_documents or []
         selected_source_documents = req.selected_source_documents or []
-        if not selected_diligence_documents and not selected_source_documents:
-            return reunderwrite_error("invalid_input", "At least one selected diligence or source document is required", 400)
+        manual_notes = req.manual_evidence_notes or []
+        if not selected_diligence_documents and not selected_source_documents and not manual_notes:
+            return reunderwrite_error("invalid_input", "At least one selected diligence document, source document, or manual evidence note is required", 400)
         total_docs = len(selected_diligence_documents) + len(selected_source_documents)
         total_bytes = declared_total_bytes(req)
         logger.info(
@@ -1509,9 +1553,13 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             suffix = f" while processing {name_hint}" if name_hint else ""
             return reunderwrite_error("parse_failed", f"Selected document parse failed{suffix}: {e}", 422)
 
-        combined_text = source_text + diligence_text
+        manual_text = manual_evidence_text(manual_notes)
+        combined_text = source_text + diligence_text + manual_text
         source_files = [*source_source_files, *diligence_source_files]
         file_classes = {**source_file_classes, **diligence_file_classes}
+        if manual_text:
+            source_files.append("Manual diligence notes")
+            file_classes["Manual diligence notes"] = "manual_user_note"
         skipped = [*source_skipped, *diligence_skipped]
         if not combined_text.strip():
             return reunderwrite_error("parse_failed", "Could not extract text from selected documents.", 422)
@@ -1534,6 +1582,8 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
                     "content": (
                         "You are re-underwriting an existing childcare acquisition from selected retained source and diligence evidence.\n"
                         "Extract ONLY facts directly supported by the selected documents below. "
+                        "Manual_user_note sections are user-entered context: treat them as lower-confidence candidate evidence, "
+                        "do not silently override source-backed document values, and flag conflicts for review. "
                         "Use the base snapshot only as context for entity matching and field names. "
                         "If a value is not present in the selected documents, return null for that field; "
                         "do not copy values from the base snapshot.\n\n"
@@ -1565,6 +1615,7 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             merged_meta["reunderwrite_source_type"] = "selected_source_and_diligence_documents"
             merged_meta["selected_source_document_ids"] = [doc.id for doc in selected_source_documents]
             merged_meta["selected_diligence_document_ids"] = [doc.id for doc in selected_diligence_documents]
+            merged_meta["manual_evidence_note_count"] = len(manual_notes)
             merged_meta["selected_source_files"] = source_files
 
         if req.pipeline_projects is not None:
@@ -1664,6 +1715,7 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             "mode": "selected_source_and_diligence_documents",
             "source_document_ids": [doc.id for doc in selected_source_documents],
             "diligence_document_ids": [doc.id for doc in selected_diligence_documents],
+            "manual_evidence_note_count": len(manual_notes),
             "skipped_files": skipped,
         }
         changed_fields = _changed_top_level_fields(changed_paths)

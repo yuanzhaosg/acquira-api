@@ -244,6 +244,64 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertTrue(any(risk["reason"] == "manual review required" for risk in workflow["risks"]))
         self.assertIn("payroll detail", workflow["missing_fields"])
 
+    def test_workbook_rows_derive_financial_and_occupancy_facts(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["databook.xlsx"], "missing_fields": ["revenue", "payroll", "ebitda", "occupancy_history"]},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {}},
+                "occupancy": {},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== databook.xlsx (pl_excel) ===\n"
+                "WORKBOOK_DIGEST: databook.xlsx\n"
+                "SHEET: Adjusted Actuals\n"
+                "D23=Total revenue | E23=100000 | F23=1200000\n"
+                "D30=Total Employment Costs | E30=50000 | F30=620000\n"
+                "D36=Rent | E36=9000 | F36=110000\n"
+                "D41=Normalised EBITDA | E41=18000 | F41=210000\n"
+                "SHEET: Output Occupancy\n"
+                "A1=Week | B1=Occupancy\n"
+                "A2=Week 1 | B2=0.82\n"
+                "A3=Week 2 | B3=0.84\n"
+                "A4=Week 3 | B4=0.86\n"
+                "A5=Week 4 | B5=0.88\n"
+            ),
+            source_files=["databook.xlsx"],
+            file_classes={"databook.xlsx": "pl_excel"},
+        )
+
+        fields = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(fields["revenue"]["value"], 1200000)
+        self.assertEqual(fields["payroll_labour_cost"]["value"], 620000)
+        self.assertEqual(fields["rent_pa"]["value"], 110000)
+        self.assertEqual(fields["normalised_ebitda"]["value"], 210000)
+        self.assertEqual(fields["avg_4wk_occupancy_pct"]["value"], 85)
+        self.assertEqual(workflow["valuation_gate"]["required_evidence"]["occupancy_history"], True)
+        self.assertNotIn("occupancy_history", [str(field).lower() for field in workflow["missing_fields"]])
+
+    def test_manual_evidence_notes_are_low_confidence_and_redacted(self):
+        text = main.manual_evidence_text([
+            main.ManualEvidenceNote(
+                source_label="Payroll diligence item",
+                diligence_item_id="item-1",
+                status="received",
+                category="financials",
+                question="Confirm payroll",
+                notes="Broker says payroll is 620000. API key sk-ant-secret should not be present elsewhere.",
+            )
+        ])
+
+        self.assertIn("SOURCE_TYPE: manual_user_note", text)
+        self.assertIn("CONFIDENCE: low", text)
+        self.assertIn("STATUS: received", text)
+        self.assertNotIn("sk-ant-secret", text)
+        self.assertIn("[redacted_api_key]", text)
+        self.assertIn("Do not silently override source-backed document values", text)
+
 
 if __name__ == "__main__":
     unittest.main()

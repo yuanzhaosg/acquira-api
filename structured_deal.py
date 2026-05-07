@@ -122,6 +122,7 @@ FIELD_META: dict[str, dict[str, str | None]] = {
     "fy25_avg_occupancy_pct": {"category": "occupancy", "label": "FY25 average occupancy", "unit": "percent"},
     "revenue": {"category": "financials", "label": "FY25 revenue", "unit": "aud"},
     "ebitda": {"category": "financials", "label": "FY25 EBITDA", "unit": "aud"},
+    "normalised_ebitda": {"category": "financials", "label": "FY25 normalised EBITDA", "unit": "aud"},
     "payroll_labour_cost": {"category": "financials", "label": "FY25 payroll / labour cost", "unit": "aud"},
     "rent_pa": {"category": "lease", "label": "Annual rent", "unit": "aud"},
     "asking_price": {"category": "valuation", "label": "Asking price", "unit": "aud"},
@@ -251,6 +252,55 @@ def _line_windows(text: str) -> list[str]:
         if idx + 2 < len(lines):
             windows.append(f"{line} {lines[idx + 1]} {lines[idx + 2]}")
     return windows
+
+
+def _parse_number(value: str) -> float | None:
+    cleaned = re.sub(r"[,$\s]", "", value or "")
+    if not cleaned:
+        return None
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    cleaned = cleaned.strip("()")
+    try:
+        parsed = float(cleaned)
+    except ValueError:
+        return None
+    return -parsed if negative else parsed
+
+
+def _cell_values_from_line(line: str) -> list[float]:
+    values: list[float] = []
+    for cell in re.finditer(r"\b[A-Z]{1,3}\d+\s*=\s*([^|]+)", line or ""):
+        raw = cell.group(1).strip()
+        if re.search(r"[A-Za-z]", raw) and not re.search(r"\$\s*\d", raw):
+            continue
+        for number in re.findall(r"\(?-?\$?\s*\d[\d,]*(?:\.\d+)?\)?", raw):
+            parsed = _parse_number(number)
+            if parsed is not None:
+                values.append(parsed)
+    return values
+
+
+def _money_from_line(line: str, prefer: str = "largest_abs") -> float | int | None:
+    values = _cell_values_from_line(line)
+    if not values:
+        values = [
+            parsed for parsed in (
+                _parse_number(match.group(0))
+                for match in re.finditer(r"\(?-?\$?\s*\d{2,3}(?:,\d{3})+(?:\.\d+)?\)?", line or "")
+            )
+            if parsed is not None
+        ]
+    values = [value for value in values if abs(value) >= 100]
+    if not values:
+        return None
+    if prefer == "last":
+        chosen = values[-1]
+    elif prefer == "positive_largest":
+        positives = [value for value in values if value > 0]
+        chosen = max(positives or values, key=abs)
+    else:
+        chosen = max(values, key=abs)
+    return int(chosen) if float(chosen).is_integer() else round(chosen, 2)
 
 
 def _context_excerpt(text: str, start: int, end: int, radius: int = 120) -> str:
@@ -472,6 +522,61 @@ def extract_occupancy_facts_from_text(combined_text: str) -> list[dict[str, Any]
                     "excerpt": line.strip()[:500],
                     "label": label,
                 })
+    derived = derive_occupancy_average_facts_from_text(combined_text)
+    existing_fields = {fact.get("field") for fact in facts}
+    for fact in derived:
+        if fact.get("field") not in existing_fields:
+            facts.append(fact)
+            existing_fields.add(fact.get("field"))
+    return facts
+
+
+def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    for page in _iter_source_pages(combined_text):
+        text = page["text"]
+        if not re.search(r"\b(utili[sz]ation|occupancy)\b", text, re.IGNORECASE):
+            continue
+        if not re.search(r"\b(SHEET:\s*(?:Output Occupancy|Utilisation XPLOR)|week|month|weekly|monthly)\b", text, re.IGNORECASE):
+            continue
+        values: list[float] = []
+        lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines()]
+        for line in [line for line in lines if line]:
+            line_l = line.lower()
+            if not re.search(r"\b(utili[sz]ation|occupancy|week|month|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", line_l):
+                continue
+            for match in re.finditer(r"\b(\d{1,3}(?:\.\d+)?)\s*%", line):
+                value = float(match.group(1))
+                if 0 <= value <= 100:
+                    values.append(value)
+            for token in _cell_values_from_line(line):
+                if 0.2 <= token <= 1.0:
+                    values.append(token * 100)
+                elif 20 <= token <= 100:
+                    values.append(token)
+        if len(values) < 4:
+            continue
+        excerpt = "Derived from occupancy/utilisation history rows in workbook digest; needs review against the original sheet."
+        derived_specs = [
+            ("avg_4wk_occupancy_pct", values[-4:], "Derived 4-week average occupancy"),
+        ]
+        if len(values) >= 13:
+            derived_specs.append(("avg_13wk_occupancy_pct", values[-13:], "Derived 13-week average occupancy"))
+        for field, sample, label in derived_specs:
+            average = round(sum(sample) / len(sample), 1)
+            if average.is_integer():
+                average = int(average)
+            facts.append({
+                "field": field,
+                "value": average,
+                "source_label": page["source_label"],
+                "page": page["page"],
+                "confidence": "medium",
+                "extraction_method": "excel_digest:derived_occupancy_average",
+                "excerpt": excerpt,
+                "label": label,
+            })
+        break
     return facts
 
 
@@ -489,10 +594,74 @@ def _text_has_occupancy_history(combined_text: str) -> bool:
         text = page["text"]
         if re.search(r"\b(utili[sz]ation|occupancy)\b", text, re.IGNORECASE):
             pct_count = len(re.findall(r"\b\d{1,3}(?:\.\d+)?\s*%", text))
+            decimal_pct_count = len(re.findall(r"\b0\.\d{2,4}\b", text))
             row_count = len(re.findall(r"\b(?:week|month|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", text, re.IGNORECASE))
-            if pct_count >= 3 and row_count >= 2:
+            if (pct_count + decimal_pct_count) >= 3 and row_count >= 2:
                 return True
     return False
+
+
+def extract_financial_facts_from_text(combined_text: str) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    specs = [
+        (
+            "normalised_ebitda",
+            re.compile(r"\b(?:normalised|normalized)\s+ebitda\b", re.IGNORECASE),
+            "Normalised EBITDA",
+            "last",
+        ),
+        (
+            "revenue",
+            re.compile(r"\b(?:total\s+(?:income|revenue)|revenue|childcare\s+fee\s+income|fees?\s+income)\b", re.IGNORECASE),
+            "Revenue",
+            "positive_largest",
+        ),
+        (
+            "payroll_labour_cost",
+            re.compile(r"\b(?:total\s+employment\s+costs?|employment\s+costs?|wages?\s*(?:&|and)?\s*salaries|payroll|labou?r)\b", re.IGNORECASE),
+            "Payroll / labour cost",
+            "positive_largest",
+        ),
+        (
+            "rent_pa",
+            re.compile(r"\b(?:rent|occupancy\s+costs?)\b", re.IGNORECASE),
+            "Rent",
+            "positive_largest",
+        ),
+        (
+            "ebitda",
+            re.compile(r"\b(?:total\s+ebitda|ebitda|operating\s+profit|net\s+profit)\b", re.IGNORECASE),
+            "EBITDA / profit",
+            "last",
+        ),
+    ]
+    seen: set[str] = set()
+    for page in _iter_source_pages(combined_text):
+        for line in _line_windows(page["text"]):
+            line_l = line.lower()
+            if "manual_user_note" in line_l:
+                continue
+            for field, pattern, label, prefer in specs:
+                if field in seen or not pattern.search(line):
+                    continue
+                value = _money_from_line(line, prefer)
+                if value is None:
+                    continue
+                facts.append({
+                    "field": field,
+                    "value": value,
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "medium",
+                    "extraction_method": "excel_digest:derived_financials",
+                    "excerpt": line.strip()[:500],
+                    "label": label,
+                })
+                seen.add(field)
+                break
+        if {"revenue", "payroll_labour_cost", "rent_pa", "ebitda"}.issubset(seen):
+            break
+    return facts
 
 
 def extract_missing_field_support_from_text(combined_text: str) -> list[dict[str, Any]]:
@@ -566,7 +735,7 @@ def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = 
     ratios = _as_dict(extracted.get("key_ratios"))
 
     revenue = fy25.get("revenue") or ratios.get("revenue_fy25")
-    ebitda = fy25.get("ebitda") or ratios.get("ebitda_fy25") or ratios.get("ebitda_3yr_avg")
+    ebitda = fy25.get("ebitda") or fy25.get("normalised_ebitda") or ratios.get("ebitda_fy25") or ratios.get("ebitda_3yr_avg")
     labour = fy25.get("total_labour_cost")
     occupancy_history = _has_occupancy_history(extracted, combined_text)
 
@@ -801,8 +970,9 @@ def build_extracted_facts(
     data_quality = str(_get(extracted, "meta", "data_quality") or "")
     occupancy_text_facts = extract_occupancy_facts_from_text(combined_text)
     support_text_facts = extract_missing_field_support_from_text(combined_text)
+    financial_text_facts = extract_financial_facts_from_text(combined_text)
     text_fact_by_field: dict[str, dict[str, Any]] = {}
-    for fact in [*occupancy_text_facts, *support_text_facts]:
+    for fact in [*occupancy_text_facts, *support_text_facts, *financial_text_facts]:
         text_fact_by_field.setdefault(fact["field"], fact)
 
     occupancy = _ensure_dict(extracted, "occupancy")
@@ -824,6 +994,14 @@ def build_extracted_facts(
     fy25 = _ensure_dict(financials, "fy25")
     if text_fact_by_field.get("rent_pa") and not _present(fy25.get("rent_pa")):
         fy25["rent_pa"] = text_fact_by_field["rent_pa"]["value"]
+    if text_fact_by_field.get("revenue") and not _present(fy25.get("revenue")):
+        fy25["revenue"] = text_fact_by_field["revenue"]["value"]
+    if text_fact_by_field.get("payroll_labour_cost") and not _present(fy25.get("total_labour_cost")):
+        fy25["total_labour_cost"] = text_fact_by_field["payroll_labour_cost"]["value"]
+    if text_fact_by_field.get("ebitda") and not _present(fy25.get("ebitda")):
+        fy25["ebitda"] = text_fact_by_field["ebitda"]["value"]
+    if text_fact_by_field.get("normalised_ebitda") and not _present(fy25.get("normalised_ebitda")):
+        fy25["normalised_ebitda"] = text_fact_by_field["normalised_ebitda"]["value"]
     if text_fact_by_field.get("asking_price") and not _present(_get(extracted, "financials", "asking_price")):
         financials["asking_price"] = text_fact_by_field["asking_price"]["value"]
 
@@ -842,6 +1020,7 @@ def build_extracted_facts(
         ("fy25_avg_occupancy_pct", _get(extracted, "occupancy", "fy25_avg_pct"), "extracted_json"),
         ("revenue", _get(extracted, "financials", "fy25", "revenue") or _get(extracted, "key_ratios", "revenue_fy25"), "extracted_json"),
         ("ebitda", _get(extracted, "financials", "fy25", "ebitda") or _get(extracted, "key_ratios", "ebitda_fy25"), "extracted_json"),
+        ("normalised_ebitda", _get(extracted, "financials", "fy25", "normalised_ebitda"), "extracted_json"),
         ("payroll_labour_cost", _get(extracted, "financials", "fy25", "total_labour_cost"), "extracted_json"),
         ("rent_pa", _get(extracted, "financials", "fy25", "rent_pa") or _get(extracted, "key_ratios", "rent_pa_fy25"), "extracted_json"),
         ("asking_price", _get(extracted, "financials", "asking_price") or _get(extracted, "key_ratios", "asking_price"), "extracted_json"),
@@ -904,10 +1083,16 @@ def build_missing_fields(extracted: dict[str, Any], extracted_facts: list[dict[s
         ]
     remove_when_present = {
         "rent_pa": ["rent", "lease_rent", "annual_rent"],
+        "revenue": ["revenue", "income"],
+        "ebitda": ["ebitda", "profit"],
+        "normalised_ebitda": ["normalised_ebitda", "normalized_ebitda"],
+        "payroll_labour_cost": ["payroll", "labour", "labor", "wages", "employment_cost"],
         "licensed_places": ["licensed_places", "licensed capacity", "capacity", "approved_places"],
         "asking_price": ["asking_price", "business_price", "purchase_price", "sale_price"],
         "current_occupancy_pct": ["current_occupancy", "current_utilisation", "current_utilization"],
         "latest_week_occupancy_pct": ["latest_week_occupancy", "latest_week_utilisation", "latest_week_utilization"],
+        "avg_4wk_occupancy_pct": ["occupancy_history", "occupancy history", "4-week", "4 week"],
+        "avg_13wk_occupancy_pct": ["occupancy_history", "occupancy history", "13-week", "13 week"],
     }
     for present_field, markers in remove_when_present.items():
         if present_field not in present_fields:

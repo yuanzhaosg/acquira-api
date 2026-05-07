@@ -234,7 +234,7 @@ Daily fees: Nursery $180 per day, Toddlers $170 per day
             file_classes={"Sample IM.pdf": "im_pdf"},
         )
 
-        self.assertIn("payroll", result["missing_fields"])
+        self.assertNotIn("payroll", result["missing_fields"])
         self.assertNotIn("fee_schedule", result["missing_fields"])
         self.assertNotIn("pricing_data", result["missing_fields"])
         self.assertTrue(any(f["field"].startswith("fee_") for f in result["facts"]))
