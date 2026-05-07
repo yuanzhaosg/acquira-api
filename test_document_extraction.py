@@ -292,6 +292,13 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertEqual(workflow["valuation_gate"]["required_evidence"]["occupancy_history"], True)
         self.assertEqual(workflow["valuation_gate"]["status"], "needs_review")
         self.assertNotIn("occupancy_history", [str(field).lower() for field in workflow["missing_fields"]])
+        self.assertIn("canonical_facts", workflow)
+        self.assertIn("valuation_gate_summary", workflow)
+        self.assertIn("evidence_quality", workflow)
+        self.assertIn("evidence_readiness", workflow)
+        self.assertIn("partner_judgement_prompts", workflow)
+        self.assertTrue(workflow["canonical_facts"].get("revenue"))
+        self.assertTrue(workflow["valuation_gate_summary"].get("rows"))
 
     def test_workbook_derived_financials_prefer_workbook_and_flag_conflict(self):
         workflow = build_structured_deal_intelligence(
