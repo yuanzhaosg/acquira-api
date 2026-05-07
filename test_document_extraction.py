@@ -632,6 +632,84 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertNotEqual(workflow["evidence_quality"]["evidence_quality"], "High")
         self.assertEqual(workflow["evidence_quality"]["underwriting_reliability"], "Review required")
 
+    def test_crown_kiddo_im_monthly_occupancy_and_normalised_profit(self):
+        text = (
+            "=== Information Memorandum(1).pdf (im_pdf) ===\n"
+            "--- Page 4 ---\n"
+            "Crown Kiddo Education, 71-73 John Paul Drive, Hillside VIC 3037. 55 licensed places. "
+            "FY2025 total income $1,576,862 reported net profit $407,682 vendor indicative normalised NP $472,860 "
+            "normalised by adding back $65,178 one-off repairs and maintenance. Average daily fee $135.\n"
+            "--- Page 7 ---\n"
+            "Business Overview monthly utilisation Jul 2025 78%, Aug 78%, Sep 75%, Oct 75%, Nov 74%, Dec 72%, "
+            "Jan 66%, Feb 58%, Mar 60%. FY26 YTD average 71%. FY2024 peak occupancy 93%. "
+            "FY2026 YTD trading revenue $999,209.97 for 1 Jul 2025 to 29 Mar 2026, 195 trading days, 71% weighted average occupancy.\n"
+            "--- Page 8 ---\n"
+            "Lease Summary expires 2027. Current rent $9,351.47/month inc GST, $112,218 p.a. inc GST / $102,016 p.a. ex GST.\n"
+            "--- Page 9 ---\n"
+            "Financial Overview FY2025 total income $1,576,862 services income $1,517,062 government subsidies $59,800 "
+            "rent $110,953 wages & salaries $791,058 superannuation $116,439 total expenses $1,148,835 "
+            "reported net profit $407,682 one-off repairs addbacks $47,625 + $17,553 = $65,178 normalised net profit $472,860."
+        )
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["Information Memorandum(1).pdf"], "missing_fields": ["avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "asking_price"]},
+                "centre": {},
+                "financials": {"fy25": {}},
+                "occupancy": {},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Crown Kiddo Education"},
+            combined_text=text,
+            source_files=["Information Memorandum(1).pdf"],
+            file_classes={"Information Memorandum(1).pdf": "im_pdf"},
+        )
+
+        fields = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(fields["revenue"]["value"], 1576862)
+        self.assertEqual(fields["ebitda"]["value"], 407682)
+        self.assertEqual(fields["normalised_ebitda"]["value"], 472860)
+        self.assertEqual(fields["payroll_labour_cost"]["value"], 907497)
+        self.assertEqual(fields["rent_pa"]["value"], 112218)
+        self.assertEqual(fields["current_occupancy_pct"]["value"], 60)
+        self.assertEqual(fields["monthly_avg_occupancy_pct"]["value"], 70.7)
+        self.assertEqual(fields["avg_4wk_occupancy_pct"]["underwriting_use"], "blocked")
+        self.assertEqual(fields["avg_13wk_occupancy_pct"]["underwriting_use"], "blocked")
+        self.assertEqual(workflow["valuation_gate"]["required_evidence"]["occupancy_history"], True)
+        self.assertEqual(workflow["valuation_gate"]["status"], "needs_review")
+        requests = " ".join(item["question"] for item in workflow["diligence_checklist"])
+        self.assertEqual(requests.count("Upload occupancy/utilisation export"), 1)
+
+    def test_manual_asking_price_fact_is_review_required(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["Manual diligence notes"], "missing_fields": []},
+                "centre": {"licensed_places": 55},
+                "financials": {"asking_price": 1200000, "fy25": {"revenue": 1000000, "ebitda": 240000, "total_labour_cost": 500000}},
+                "key_ratios": {"asking_price": 1200000},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== Manual diligence notes (manual_user_note) ===\n"
+                "--- Manual Evidence 1 ---\n"
+                "SOURCE_TYPE: manual_user_note\n"
+                "QUESTION: User-provided asking price\n"
+                "NOTES: asking_price: 1200000\n"
+            ),
+            source_files=["Manual diligence notes"],
+            file_classes={"Manual diligence notes": "manual_user_note"},
+        )
+
+        asking = workflow["canonical_facts"]["asking_price"]
+        self.assertEqual(asking["value"], 1200000)
+        self.assertEqual(asking["source_type"], "manual_context")
+        self.assertEqual(asking["source_quality"], "manual")
+        self.assertEqual(asking["underwriting_use"], "review_required")
+        self.assertIn("User-provided asking price", asking["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

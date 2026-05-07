@@ -1498,6 +1498,72 @@ def manual_evidence_text(notes: list[ManualEvidenceNote]) -> str:
         return ""
     return "\n\n=== Manual diligence notes (manual_user_note) ===\n" + "\n\n".join(chunks)
 
+
+def parse_currency_value(value: str | None) -> int | None:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return None
+    multiplier = 1
+    if re.search(r"\b(m|million)\b", raw):
+        multiplier = 1_000_000
+    elif re.search(r"\b(k|thousand)\b", raw):
+        multiplier = 1_000
+    cleaned = re.sub(r"[$,\s]", "", raw)
+    cleaned = re.sub(r"(aud|approximately|approx\.?|million|thousand)", "", cleaned)
+    cleaned = re.sub(r"[mk]\b", "", cleaned)
+    try:
+        parsed = float(cleaned)
+    except ValueError:
+        return None
+    return int(round(parsed * multiplier)) if parsed > 0 else None
+
+
+def asking_price_from_manual_notes(notes: list[ManualEvidenceNote]) -> int | None:
+    for note in notes:
+        haystack = "\n".join([note.question or "", note.notes or "", note.status or ""])
+        match = re.search(r"\basking[_\s-]*price\b\s*[:=\-]?\s*(\$?\s*[\d,.]+\s*(?:m|k|million|thousand)?)", haystack, re.IGNORECASE)
+        if match:
+            value = parse_currency_value(match.group(1))
+            if value:
+                return value
+    return None
+
+
+def apply_manual_asking_price(extracted: dict[str, Any], asking_price: int | None) -> bool:
+    if not asking_price:
+        return False
+    financials = extracted.setdefault("financials", {})
+    if not isinstance(financials, dict):
+        return False
+    ratios = extracted.setdefault("key_ratios", {})
+    if not isinstance(ratios, dict):
+        return False
+    existing = financials.get("asking_price") or ratios.get("asking_price")
+    meta = extracted.setdefault("meta", {})
+    if isinstance(meta, dict):
+        meta["manual_asking_price_present"] = True
+    if existing and existing != asking_price:
+        if isinstance(meta, dict):
+            meta.setdefault("manual_context_conflicts", []).append({
+                "field": "asking_price",
+                "manual_value": asking_price,
+                "existing_value": existing,
+                "reason": "User-provided asking price differs from source-backed asking price.",
+            })
+        return False
+    financials["asking_price"] = asking_price
+    ratios["asking_price"] = asking_price
+    fy25 = financials.get("fy25") if isinstance(financials.get("fy25"), dict) else {}
+    ebitda = fy25.get("normalised_ebitda") or fy25.get("ebitda") or ratios.get("ebitda_fy25")
+    places = extracted.get("centre", {}).get("licensed_places") if isinstance(extracted.get("centre"), dict) else ratios.get("licensed_places")
+    if isinstance(ebitda, (int, float)) and ebitda > 0:
+        financials["asking_price_ebitda_multiple"] = round(asking_price / ebitda, 2)
+        ratios["ebitda_multiple"] = round(asking_price / ebitda, 2)
+        ratios["implied_ebitda_yield_pct"] = round((ebitda / asking_price) * 100, 1)
+    if isinstance(places, (int, float)) and places > 0:
+        ratios["asking_price_per_place"] = round(asking_price / places)
+    return True
+
 @app.post("/pipeline/reunderwrite")
 async def pipeline_reunderwrite(req: ReunderwriteRequest):
     work_dir = tempfile.mkdtemp(prefix="acquira-reunderwrite-")
@@ -1510,17 +1576,19 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
         selected_diligence_documents = req.selected_diligence_documents or []
         selected_source_documents = req.selected_source_documents or []
         manual_notes = req.manual_evidence_notes or []
+        manual_asking_price = asking_price_from_manual_notes(manual_notes)
         if not selected_diligence_documents and not selected_source_documents and not manual_notes:
             return reunderwrite_error("invalid_input", "At least one selected diligence document, source document, or manual evidence note is required", 400)
         total_docs = len(selected_diligence_documents) + len(selected_source_documents)
         total_bytes = declared_total_bytes(req)
         logger.info(
-            "reunderwrite.inputs run_id=%s deal_id=%s source_docs=%s diligence_docs=%s declared_bytes=%s",
+            "reunderwrite.inputs run_id=%s deal_id=%s source_docs=%s diligence_docs=%s declared_bytes=%s has_asking_price=%s",
             req.run_id,
             req.deal_id,
             len(selected_source_documents),
             len(selected_diligence_documents),
             total_bytes,
+            bool(manual_asking_price),
         )
         if total_docs > MAX_REUNDERWRITE_DOCUMENTS:
             return reunderwrite_error("invalid_input", f"Select {MAX_REUNDERWRITE_DOCUMENTS} or fewer documents for one re-underwrite run.", 400)
@@ -1607,6 +1675,8 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             changed_paths=changed_paths,
             conflicts=merge_conflicts,
         )
+        if apply_manual_asking_price(merged_extracted, manual_asking_price):
+            changed_paths.update({"financials.asking_price", "key_ratios.asking_price"})
 
         merged_meta = merged_extracted.setdefault("meta", {})
         if isinstance(merged_meta, dict):
@@ -1685,6 +1755,8 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             return reunderwrite_error("scoring_failed", f"Scoring failed during re-underwrite: {e}", 502)
         logger.info("reunderwrite.scoring_complete run_id=%s deal_id=%s", req.run_id, req.deal_id)
         recalculate_total_score(new_scored)
+        if manual_asking_price:
+            new_scored["asking_price"] = manual_asking_price
         new_scored["scoring_version"] = "2.4-reunderwrite"
         new_scored["scoring_timestamp"] = datetime.now(timezone.utc).isoformat()
         new_scored["reunderwrite_run_id"] = req.run_id
@@ -1718,6 +1790,12 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
             "manual_evidence_note_count": len(manual_notes),
             "skipped_files": skipped,
         }
+        logger.info(
+            "reunderwrite.workflow_summary run_id=%s includes_asking_price=%s asking_price_underwriting_use=%s",
+            req.run_id,
+            "asking_price" in (structured_intel.get("canonical_facts") or {}),
+            ((structured_intel.get("canonical_facts") or {}).get("asking_price") or {}).get("underwriting_use"),
+        )
         changed_fields = _changed_top_level_fields(changed_paths)
         annotate_base_snapshot_facts(structured_intel, changed_fields, req.run_id)
         annotate_run_evidence_metadata(structured_intel, req.run_id)

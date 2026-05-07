@@ -18,6 +18,7 @@ CANONICAL_FIELD_ALIASES = {
     "payroll_labour_cost": ["payroll_labour_cost", "labour_cost", "labor_cost", "wages_salaries"],
     "rent": ["rent_pa", "rent", "lease_rent"],
     "current_occupancy": ["current_occupancy_pct", "current_month_occupancy_pct"],
+    "monthly_occupancy": ["monthly_avg_occupancy_pct", "fy25_avg_occupancy_pct"],
     "avg_4wk_occupancy": ["avg_4wk_occupancy_pct"],
     "avg_13wk_occupancy": ["avg_13wk_occupancy_pct"],
     "licensed_places": ["licensed_places"],
@@ -142,7 +143,7 @@ def _source_for_field(field: str, source_files: list[str], file_classes: dict[st
         "rent_pa": ["lease_pdf", "lease_docx", "pl_excel", "im_pdf", "im_docx"],
         "licensed_places": ["service_approval_pdf", "im_pdf", "im_docx"],
         "nqs_rating": ["nqs_pdf", "service_approval_pdf", "im_pdf", "im_docx"],
-        "asking_price": ["im_pdf", "im_docx"],
+        "asking_price": ["manual_user_note", "im_pdf", "im_docx"],
     }
 
     for cls in preferred_classes.get(field, []):
@@ -471,8 +472,10 @@ def _add_fact(
         reason = period.get("coverage_reason") or "Evidence exists, but source quality, extraction certainty, coverage, or conflicts require review."
     if trust == "disputed":
         next_action = "Resolve conflicting source values before relying on this field."
-    elif field == "avg_13wk_occupancy_pct" and underwriting_use == "blocked":
+    elif field in {"avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct"} and underwriting_use == "blocked":
         next_action = "Upload occupancy/utilisation export covering at least 13 weeks."
+    elif underwriting_use == "review_required" and field == "asking_price" and source_type == "manual_context":
+        reason = "User-provided asking price; verify against broker/vendor."
     if underwriting_use == "review_required" and field == "payroll_labour_cost" and period.get("coverage_status") in {"partial", "unknown"}:
         next_action = "Upload full FY payroll export or payroll summary matching the revenue period."
     if underwriting_use == "review_required" and field in {"revenue", "ebitda", "normalised_ebitda"} and period.get("coverage_status") in {"partial", "unknown"}:
@@ -621,7 +624,7 @@ def _money_from_line(line: str, prefer: str = "largest_abs") -> float | int | No
         values = [
             parsed for parsed in (
                 _parse_number(match.group(0))
-                for match in re.finditer(r"\(?-?\$?\s*\d{2,3}(?:,\d{3})+(?:\.\d+)?\)?", line or "")
+                for match in re.finditer(r"\(?-?\$?\s*\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?", line or "")
             )
             if parsed is not None
         ]
@@ -630,6 +633,8 @@ def _money_from_line(line: str, prefer: str = "largest_abs") -> float | int | No
         return None
     if prefer == "last":
         chosen = values[-1]
+    elif prefer == "first":
+        chosen = values[0]
     elif prefer == "positive_largest":
         positives = [value for value in values if value > 0]
         chosen = max(positives or values, key=abs)
@@ -907,6 +912,22 @@ def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[st
         excerpt = "Derived from occupancy/utilisation history rows in workbook digest; needs review against the original sheet."
         weekly_signal = bool(re.search(r"\b(week|weekly|w/e|week\s+ending)\b", text, re.IGNORECASE))
         monthly_signal = bool(re.search(rf"\b({MONTH_RE}|month|monthly)\b", text, re.IGNORECASE))
+        monthly_values: list[float] = []
+        if monthly_signal:
+            month_pair_values = [
+                float(match.group(1))
+                for match in re.finditer(rf"\b{MONTH_RE}\b\s*(?:20\d{{2}})?\s*(\d{{1,3}}(?:\.\d+)?)\s*%", text, re.IGNORECASE)
+            ]
+            if len(month_pair_values) >= 4:
+                monthly_values = [value for value in month_pair_values if 0 <= value <= 100]
+            else:
+                for line in lines:
+                    if not re.search(rf"\b({MONTH_RE})\b", line, re.IGNORECASE):
+                        continue
+                    for match in re.finditer(r"\b(\d{1,3}(?:\.\d+)?)\s*%", line):
+                        value = float(match.group(1))
+                        if 0 <= value <= 100:
+                            monthly_values.append(value)
         if weekly_signal:
             derived_specs = [
                 ("avg_4wk_occupancy_pct", values[-4:], "Derived 4-week average occupancy"),
@@ -914,8 +935,29 @@ def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[st
             if len(values) >= 13:
                 derived_specs.append(("avg_13wk_occupancy_pct", values[-13:], "Derived 13-week average occupancy"))
         else:
-            sample = values[-min(len(values), 12):]
+            occupancy_values = monthly_values if len(monthly_values) >= 4 else values
+            sample = occupancy_values[-min(len(occupancy_values), 12):]
             derived_specs = [("monthly_avg_occupancy_pct", sample, "Derived monthly average occupancy")]
+            latest_month = occupancy_values[-1]
+            if latest_month.is_integer():
+                latest_month = int(latest_month)
+            facts.append({
+                "field": "current_occupancy_pct",
+                "value": latest_month,
+                "source_label": page["source_label"],
+                "page": page["page"],
+                "confidence": "medium",
+                "extraction_method": "excel_digest:derived_occupancy_average",
+                "excerpt": "Latest monthly occupancy observation from monthly utilisation history; needs review against source report.",
+                "cell_range": _cell_range_from_line(text),
+                "period": {
+                    "coverage_status": "partial",
+                    "coverage_reason": "Monthly occupancy history observed; latest month used as current occupancy proxy.",
+                    "period_label": f"latest of {len(occupancy_values)} monthly occupancy observations",
+                    "observation_count": len(occupancy_values),
+                },
+                "label": "Latest month occupancy / utilisation",
+            })
         for field, sample, label in derived_specs:
             average = round(sum(sample) / len(sample), 1)
             if average.is_integer():
@@ -1007,8 +1049,8 @@ def extract_financial_facts_from_text(combined_text: str) -> list[dict[str, Any]
     specs = [
         (
             "normalised_ebitda",
-            re.compile(r"\b(?:normalised|normalized)\s+ebitda\b", re.IGNORECASE),
-            "Normalised EBITDA",
+            re.compile(r"\b(?:normalised|normalized)\s+(?:ebitda|net\s+profit|np|profit)\b", re.IGNORECASE),
+            "Normalised net profit / EBITDA proxy",
             "last",
         ),
         (
@@ -1038,6 +1080,57 @@ def extract_financial_facts_from_text(combined_text: str) -> list[dict[str, Any]
     ]
     seen: set[str] = set()
     for page in _iter_source_pages(combined_text):
+        if "payroll_labour_cost" not in seen:
+            wages_match = re.search(r"\bwages?\s*(?:&|and)?\s*salaries\b.{0,80}?\$?\s*(\d{2,3}(?:,\d{3})+|\d{5,8})(?:\.\d{1,2})?", page["text"], re.IGNORECASE)
+            super_match = re.search(r"\bsuperannuation\b.{0,80}?\$?\s*(\d{2,3}(?:,\d{3})+|\d{5,8})(?:\.\d{1,2})?", page["text"], re.IGNORECASE)
+            if wages_match and super_match:
+                wages = int(wages_match.group(1).replace(",", ""))
+                superannuation = int(super_match.group(1).replace(",", ""))
+                facts.append({
+                    "field": "payroll_labour_cost",
+                    "value": wages + superannuation,
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "medium",
+                    "extraction_method": "regex:wages_plus_super",
+                    "excerpt": f"Wages & salaries {wages}; superannuation {superannuation}.",
+                    "cell_range": None,
+                    "period": _infer_period_context(page["text"], "payroll_labour_cost", page["source_label"]),
+                    "label": "Payroll / labour cost (wages + super)",
+                })
+                seen.add("payroll_labour_cost")
+        if "ebitda" not in seen:
+            reported_match = re.search(r"\breported\s+net\s+profit\b.{0,50}?\$?\s*(\d{1,3}(?:,\d{3})+|\d{5,8})(?:\.\d{1,2})?", page["text"], re.IGNORECASE)
+            if reported_match:
+                facts.append({
+                    "field": "ebitda",
+                    "value": int(reported_match.group(1).replace(",", "")),
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "medium",
+                    "extraction_method": "regex:reported_net_profit",
+                    "excerpt": reported_match.group(0)[:500],
+                    "cell_range": None,
+                    "period": _infer_period_context(page["text"], "ebitda", page["source_label"]),
+                    "label": "Reported net profit / EBITDA proxy",
+                })
+                seen.add("ebitda")
+        if "normalised_ebitda" not in seen and not re.search(r"\b[A-Z]{1,3}\d+\s*=", page["text"]):
+            normalised_match = re.search(r"\b(?:vendor\s+indicative\s+)?normalised\s+(?:net\s+profit|np|profit|ebitda)\b.{0,50}?\$?\s*(\d{1,3}(?:,\d{3})+|\d{5,8})(?:\.\d{1,2})?", page["text"], re.IGNORECASE)
+            if normalised_match:
+                facts.append({
+                    "field": "normalised_ebitda",
+                    "value": int(normalised_match.group(1).replace(",", "")),
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "medium",
+                    "extraction_method": "regex:normalised_profit",
+                    "excerpt": normalised_match.group(0)[:500],
+                    "cell_range": None,
+                    "period": _infer_period_context(page["text"], "normalised_ebitda", page["source_label"]),
+                    "label": "Normalised net profit / EBITDA proxy",
+                })
+                seen.add("normalised_ebitda")
         for line in _line_windows(page["text"]):
             line_l = line.lower()
             if "manual_user_note" in line_l:
@@ -1137,6 +1230,24 @@ def extract_manual_context_facts_from_text(combined_text: str) -> list[dict[str,
             continue
         label = "Manual diligence context"
         question = question_match.group(1).strip() if question_match else ""
+        asking_match = re.search(r"\basking[_\s-]*price\b\s*[:=\-]?\s*\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*([mk]|million|thousand)?\b", value, re.IGNORECASE)
+        if asking_match:
+            amount = float(asking_match.group(1).replace(",", ""))
+            suffix = (asking_match.group(2) or "").lower()
+            if suffix in {"m", "million"}:
+                amount *= 1_000_000
+            elif suffix in {"k", "thousand"}:
+                amount *= 1_000
+            facts.append({
+                "field": "asking_price",
+                "value": int(round(amount)),
+                "source_label": "Manual diligence notes",
+                "page": None,
+                "confidence": "low",
+                "extraction_method": "manual_user_note",
+                "excerpt": block.strip()[:500],
+                "label": "Asking price",
+            })
         facts.append({
             "field": f"manual_context_{idx}",
             "value": value[:500],
@@ -1244,7 +1355,17 @@ def build_valuation_gate(extracted: dict[str, Any], combined_text: str | None = 
     revenue_supported, revenue_review, revenue_fact = _gate_support(facts, ["revenue"])
     ebitda_supported, ebitda_review, ebitda_fact = _gate_support(facts, ["ebitda", "normalised_ebitda"])
     labour_supported, labour_review, labour_fact = _gate_support(facts, ["payroll_labour_cost"])
-    occupancy_supported, occupancy_review, occupancy_fact = _gate_support(facts, ["avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "avg_52wk_occupancy_pct", "latest_week_occupancy_pct"])
+    occupancy_supported, occupancy_review, occupancy_fact = _gate_support(facts, [
+        "avg_4wk_occupancy_pct",
+        "avg_13wk_occupancy_pct",
+        "avg_52wk_occupancy_pct",
+        "latest_week_occupancy_pct",
+        "monthly_avg_occupancy_pct",
+        "current_occupancy_pct",
+        "fy23_avg_occupancy_pct",
+        "fy24_avg_occupancy_pct",
+        "fy25_avg_occupancy_pct",
+    ])
     if not facts:
         fy25 = _as_dict(_get(extracted, "financials", "fy25"))
         ratios = _as_dict(extracted.get("key_ratios"))
@@ -1446,6 +1567,9 @@ def build_diligence_requests(
         text = re.sub(r"\s+", " ", request or "").strip()
         if not text or text.lower() in seen:
             return
+        if source == "evidence_ledger" and "occupancy/utilisation export" in text.lower():
+            if any(item.get("category") == "occupancy" for item in requests):
+                return
         seen.add(text.lower())
         linked_fact_ids, linked_evidence_ids = linked_for_fields(linked_fields)
         requests.append({
@@ -1944,7 +2068,7 @@ def build_valuation_gate_summary(valuation_gate: dict[str, Any], canonical_facts
         "revenue": ("Revenue", ["revenue"]),
         "ebitda": ("EBITDA / operating profit", ["ebitda", "normalised_ebitda"]),
         "payroll_labour_cost": ("Payroll / labour cost", ["payroll_labour_cost"]),
-        "occupancy_history": ("Occupancy history", ["avg_13wk_occupancy", "avg_4wk_occupancy", "current_occupancy"]),
+        "occupancy_history": ("Occupancy history", ["avg_13wk_occupancy", "avg_4wk_occupancy", "monthly_occupancy", "current_occupancy"]),
     }
     blocker_by_field = {
         str(blocker.get("field")): blocker
