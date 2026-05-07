@@ -85,6 +85,7 @@ OCCUPANCY_PATTERNS = {
 PAYROLL_PATTERNS = {
     "payroll_staffing": r"\b(pay run|payroll|workedhours|worked hours|staffing|employment hero|leave)\b",
 }
+MONTH_RE = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
 
 
 def sheet_category(sheet_name: str) -> str:
@@ -109,6 +110,25 @@ def redact_errors(errors: list[str]) -> list[str]:
     for error in errors:
         redacted.append(re.sub(r"sk-ant-[A-Za-z0-9_-]+", "[redacted-api-key]", error))
     return redacted
+
+
+def detect_periods(text: str) -> list[dict[str, Any]]:
+    periods: list[dict[str, Any]] = []
+    if re.search(r"\b(forecast|budget|model|pro[-\s]?forma|scenario|template|assumption)\b", text, re.I):
+        periods.append({"period_label": "forecast/template/model", "coverage_status": "unknown", "underwriting_use": "excluded", "reason": "Forecast/template/model wording detected."})
+    for match in re.finditer(r"\b(?:fy|financial year)\s*['-]?(20)?(\d{2})\b|\b(full\s+year|annual|12\s+months?)\b", text, re.I):
+        periods.append({"period_label": match.group(0), "coverage_status": "complete", "underwriting_use": "accepted_or_review_required", "reason": "Annual/full-year period label detected."})
+    for match in re.finditer(r"\b(ytd|year\s+to\s+date)\b", text, re.I):
+        periods.append({"period_label": match.group(0), "coverage_status": "partial", "underwriting_use": "review_required", "reason": "YTD period detected; annualisation/reconciliation required."})
+    for match in re.finditer(r"\b(\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)\s*[-–—]\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b", text, re.I):
+        periods.append({"period_label": match.group(0), "coverage_status": "partial", "underwriting_use": "review_required", "reason": "Pay-run/date range detected."})
+    month_count = len(set(re.findall(rf"\b{MONTH_RE}[-\s']?\d{{2,4}}\b|\b{MONTH_RE}\b", text.lower())))
+    if month_count:
+        periods.append({"period_label": f"{month_count} monthly markers", "coverage_status": "complete" if month_count >= 11 else "partial", "underwriting_use": "review_required" if month_count < 11 else "accepted_or_review_required", "reason": f"{month_count} monthly markers detected."})
+    week_count = len(re.findall(r"\b(?:week\s*(?:ending)?|w/e|weekly)\b", text, re.I))
+    if week_count:
+        periods.append({"period_label": f"{week_count} weekly observations", "coverage_status": "complete" if week_count >= 13 else "partial", "underwriting_use": "review_required", "reason": f"{week_count} weekly markers detected; 13-week average requires 13."})
+    return periods[:20]
 
 
 def evidence_refs_from_text(text: str, *, file_name: str) -> list[dict[str, Any]]:
@@ -186,6 +206,11 @@ async def inspect_pdf(path: Path) -> dict[str, Any]:
         "vision_fallback_pages": sorted(set(actual_vision_pages or predicted_vision_pages)),
         "vision_extraction_errors": vision_errors,
         "extracted_financial_fields": financial_fields,
+        "detected_periods": detect_periods(extracted_text),
+        "coverage_status_by_field": {
+            field: "review_required" if detect_periods(extracted_text) else "unknown"
+            for field in financial_fields
+        },
         "extraction_warnings": warnings,
         "evidence_refs": evidence_refs_from_text(extracted_text, file_name=path.name),
     }
@@ -200,6 +225,11 @@ def inspect_workbook(path: Path) -> dict[str, Any]:
     }
     warnings = re.findall(r"^(?:EXTRACTION_)?WARNING:\s*(.+)$", digest, re.M)
     skipped = [warning for warning in warnings if re.search(r"\b(skipped|hidden|empty)\b", warning, re.I)]
+    periods_by_sheet: dict[str, list[dict[str, Any]]] = {}
+    for sheet in sheets_seen:
+        sheet_match = re.search(rf"^SHEET:\s*{re.escape(sheet)}\n([\s\S]*?)(?=^SHEET:\s|\Z)", digest, re.M)
+        if sheet_match:
+            periods_by_sheet[sheet] = detect_periods(sheet_match.group(0))
     if len(sheets_seen) <= 1:
         warnings.append("Workbook digest read one or fewer sheets; expected multi-sheet coverage for databooks.")
     for expected_category in ("financials", "occupancy", "payroll_staffing"):
@@ -210,6 +240,18 @@ def inspect_workbook(path: Path) -> dict[str, Any]:
         "sheets_seen": sheets_seen,
         "sheets_skipped": skipped,
         "detected_categories_by_sheet": categories,
+        "detected_periods_by_sheet": periods_by_sheet,
+        "coverage_status_by_field": {
+            "financials": "review_required",
+            "payroll": "review_required",
+            "occupancy": "complete" if any(any(p.get("coverage_status") == "complete" for p in periods) for sheet, periods in periods_by_sheet.items() if sheet_category(sheet) == "occupancy") else "review_required",
+        },
+        "underwriting_use_by_field": {
+            "financials": "review_required",
+            "payroll": "review_required",
+            "occupancy": "review_required",
+        },
+        "occupancy_observation_count": max([int(p.get("period_label", "0").split(" ")[0]) for periods in periods_by_sheet.values() for p in periods if "weekly" in str(p.get("period_label")) or "monthly" in str(p.get("period_label"))] or [0]),
         "extracted_financial_fields": matches(digest, FINANCIAL_PATTERNS),
         "extracted_occupancy_fields": matches(digest, OCCUPANCY_PATTERNS),
         "extracted_payroll_fields": matches(digest, PAYROLL_PATTERNS),

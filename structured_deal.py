@@ -156,7 +156,80 @@ def _provenance(value: Any, source_type: str) -> str:
     return "found"
 
 
-def _period_for_fact(field: str, extraction_method: str, source_quality: str) -> dict[str, Any]:
+MONTH_RE = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+
+
+def _infer_period_context(text: str, field: str, source_label: str = "") -> dict[str, Any]:
+    haystack = f"{source_label}\n{text or ''}"
+    lower = haystack.lower()
+    if re.search(r"\b(forecast|budget|model|pro[-\s]?forma|scenario|assumption|template)\b", lower):
+        return {
+            "coverage_status": "partial" if "template" not in lower else "unknown",
+            "coverage_reason": "Forecast/template/model source detected; not accepted as actual historical period evidence.",
+            "period_label": "forecast/template",
+            "observation_count": None,
+        }
+    fy_match = re.search(r"\b(?:fy|financial year)\s*['-]?(20)?(\d{2})\b", lower)
+    if fy_match or re.search(r"\b(full\s+year|annual|12\s+months?)\b", lower):
+        fy = f"FY20{fy_match.group(2)}" if fy_match else None
+        return {
+            "coverage_status": "complete",
+            "coverage_reason": "Annual/full-year period label detected.",
+            "fiscal_year": fy,
+            "period_label": fy or "annual actuals",
+            "observation_count": None,
+        }
+    if re.search(r"\b(ytd|year\s+to\s+date)\b", lower):
+        return {
+            "coverage_status": "partial",
+            "coverage_reason": "YTD financial period detected; annualisation or reconciliation required.",
+            "period_label": "YTD actuals",
+            "observation_count": None,
+        }
+    pay_range = re.search(r"\b(\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)\s*[-–—]\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b", lower)
+    if pay_range:
+        return {
+            "coverage_status": "partial",
+            "coverage_reason": f"Pay-run/date range detected ({pay_range.group(0)}); full-year reconciliation is required.",
+            "period_label": pay_range.group(0),
+            "observation_count": None,
+        }
+    month_tokens = re.findall(rf"\b{MONTH_RE}[-\s']?\d{{2,4}}\b|\b{MONTH_RE}\b", lower)
+    unique_months = list(dict.fromkeys(month_tokens))
+    if len(unique_months) >= 11:
+        return {
+            "coverage_status": "complete",
+            "coverage_reason": "Monthly columns appear to cover approximately a full year.",
+            "period_label": "monthly actuals full-year coverage",
+            "observation_count": len(unique_months),
+        }
+    if len(unique_months) >= 2:
+        return {
+            "coverage_status": "partial",
+            "coverage_reason": f"{len(unique_months)} monthly period markers detected; annualisation/reconciliation required.",
+            "period_label": f"{len(unique_months)} monthly observations",
+            "observation_count": len(unique_months),
+        }
+    if field in {"avg_4wk_occupancy_pct", "avg_13wk_occupancy_pct", "avg_52wk_occupancy_pct", "latest_week_occupancy_pct"}:
+        week_count = len(re.findall(r"\b(?:week\s*(?:ending)?|w/e|weekly)\b", lower))
+        if week_count:
+            return {
+                "coverage_status": "complete" if (field == "avg_4wk_occupancy_pct" and week_count >= 4) or (field == "avg_13wk_occupancy_pct" and week_count >= 13) else "partial",
+                "coverage_reason": f"{week_count} weekly observations detected.",
+                "period_label": f"{week_count} weekly observations",
+                "observation_count": week_count,
+            }
+    return {
+        "coverage_status": "unknown",
+        "coverage_reason": "Period coverage was not fully established from the extracted evidence.",
+        "period_label": None,
+        "observation_count": None,
+    }
+
+
+def _period_for_fact(field: str, extraction_method: str, source_quality: str, period_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    if period_context:
+        return period_context
     coverage = "not_applicable"
     reason = None
     if field in {"revenue", "ebitda", "normalised_ebitda", "payroll_labour_cost", "rent_pa"}:
@@ -227,14 +300,19 @@ def _trust(value: Any, confidence: str, source_quality: str, provenance: str, co
     return "medium"
 
 
-def _underwriting_use(field: str, provenance: str, trust: str, source_quality: str, value: Any) -> str:
+def _underwriting_use(field: str, provenance: str, trust: str, source_quality: str, value: Any, period: dict[str, Any] | None = None) -> str:
     if not _present(value):
         return "blocked" if field in VALUATION_REQUIRED_FIELDS else "excluded"
     if source_quality == "template_or_forecast":
         return "excluded"
     if provenance == "manual_context":
         return "review_required"
-    if trust == "high":
+    coverage = (period or {}).get("coverage_status")
+    if coverage == "partial" and field in VALUATION_REQUIRED_FIELDS:
+        return "review_required"
+    if coverage == "unknown" and field in VALUATION_REQUIRED_FIELDS:
+        return "review_required"
+    if trust == "high" or (trust == "medium" and source_quality == "authoritative" and coverage == "complete" and provenance == "found"):
         return "accepted"
     if trust in {"medium", "low", "disputed", "unknown"}:
         return "review_required"
@@ -254,6 +332,7 @@ FIELD_META: dict[str, dict[str, str | None]] = {
     "avg_4wk_occupancy_pct": {"category": "occupancy", "label": "4-week average occupancy", "unit": "percent"},
     "avg_13wk_occupancy_pct": {"category": "occupancy", "label": "13-week average occupancy", "unit": "percent"},
     "avg_52wk_occupancy_pct": {"category": "occupancy", "label": "52-week average occupancy", "unit": "percent"},
+    "monthly_avg_occupancy_pct": {"category": "occupancy", "label": "Monthly average occupancy", "unit": "percent"},
     "fy23_avg_occupancy_pct": {"category": "occupancy", "label": "FY23 average occupancy", "unit": "percent"},
     "fy24_avg_occupancy_pct": {"category": "occupancy", "label": "FY24 average occupancy", "unit": "percent"},
     "fy25_avg_occupancy_pct": {"category": "occupancy", "label": "FY25 average occupancy", "unit": "percent"},
@@ -302,6 +381,7 @@ def _add_fact(
     label_override: str | None = None,
     cell_range: str | None = None,
     conflicts: list[dict[str, Any]] | None = None,
+    period_context: dict[str, Any] | None = None,
 ) -> None:
     evidence_id = f"ev_{_stable_token(field, source_label, page, excerpt, value)}"
     fact_id = f"fact_{_stable_token(field, value, evidence_id)}"
@@ -320,10 +400,10 @@ def _add_fact(
     source_quality = _source_quality(source_label, extraction_method)
     provenance = _provenance(value, source_type)
     trust = _trust(value, confidence, source_quality, provenance, conflicts)
-    underwriting_use = _underwriting_use(field, provenance, trust, source_quality, value)
+    period = _period_for_fact(field, extraction_method, source_quality, period_context)
+    underwriting_use = _underwriting_use(field, provenance, trust, source_quality, value, period)
     derivation_formula, derivation_recipe = _derivation_recipe(field, extraction_method, excerpt)
     derivation_note = "Derived from workbook digest rows/cells; review against the original spreadsheet before IC reliance." if provenance == "derived" else None
-    period = _period_for_fact(field, extraction_method, source_quality)
     source_ref = {
         "file_name": source_label,
         "page": page,
@@ -338,11 +418,15 @@ def _add_fact(
     if underwriting_use == "excluded":
         reason = "Observed evidence is not suitable for underwriting use."
     elif underwriting_use == "review_required":
-        reason = "Evidence exists, but source quality, extraction certainty, coverage, or conflicts require review."
+        reason = period.get("coverage_reason") or "Evidence exists, but source quality, extraction certainty, coverage, or conflicts require review."
     if trust == "disputed":
         next_action = "Resolve conflicting source values before relying on this field."
     elif field == "avg_13wk_occupancy_pct" and underwriting_use == "blocked":
         next_action = "Upload occupancy/utilisation export covering at least 13 weeks."
+    if underwriting_use == "review_required" and field == "payroll_labour_cost" and period.get("coverage_status") in {"partial", "unknown"}:
+        next_action = "Upload full FY payroll export or payroll summary matching the revenue period."
+    if underwriting_use == "review_required" and field in {"revenue", "ebitda", "normalised_ebitda"} and period.get("coverage_status") in {"partial", "unknown"}:
+        next_action = "Upload annual P&L or management accounts for the same period as payroll evidence."
     facts.append({
         "id": fact_id,
         "field": field,
@@ -771,11 +855,17 @@ def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[st
         if len(values) < 4:
             continue
         excerpt = "Derived from occupancy/utilisation history rows in workbook digest; needs review against the original sheet."
-        derived_specs = [
-            ("avg_4wk_occupancy_pct", values[-4:], "Derived 4-week average occupancy"),
-        ]
-        if len(values) >= 13:
-            derived_specs.append(("avg_13wk_occupancy_pct", values[-13:], "Derived 13-week average occupancy"))
+        weekly_signal = bool(re.search(r"\b(week|weekly|w/e|week\s+ending)\b", text, re.IGNORECASE))
+        monthly_signal = bool(re.search(rf"\b({MONTH_RE}|month|monthly)\b", text, re.IGNORECASE))
+        if weekly_signal:
+            derived_specs = [
+                ("avg_4wk_occupancy_pct", values[-4:], "Derived 4-week average occupancy"),
+            ]
+            if len(values) >= 13:
+                derived_specs.append(("avg_13wk_occupancy_pct", values[-13:], "Derived 13-week average occupancy"))
+        else:
+            sample = values[-min(len(values), 12):]
+            derived_specs = [("monthly_avg_occupancy_pct", sample, "Derived monthly average occupancy")]
         for field, sample, label in derived_specs:
             average = round(sum(sample) / len(sample), 1)
             if average.is_integer():
@@ -789,8 +879,54 @@ def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[st
                 "extraction_method": "excel_digest:derived_occupancy_average",
                 "excerpt": excerpt,
                 "cell_range": _cell_range_from_line(text),
+                "period": {
+                    "coverage_status": "complete",
+                    "coverage_reason": f"{len(values)} occupancy observations found; {len(sample)} used for this average.",
+                    "period_label": f"{len(sample)} of {len(values)} occupancy observations",
+                    "observation_count": len(values),
+                },
                 "label": label,
             })
+        if weekly_signal and len(values) < 13:
+            facts.append({
+                "field": "avg_13wk_occupancy_pct",
+                "value": None,
+                "source_label": page["source_label"],
+                "page": page["page"],
+                "confidence": "missing",
+                "extraction_method": "excel_digest:derived_occupancy_average",
+                "excerpt": f"Only {len(values)} weekly/monthly occupancy observations found; 13-week average requires 13.",
+                "cell_range": _cell_range_from_line(text),
+                "period": {
+                    "coverage_status": "partial",
+                    "coverage_reason": f"Only {len(values)} occupancy observations found; 13-week average requires 13.",
+                    "period_label": f"{len(values)} occupancy observations",
+                    "observation_count": len(values),
+                },
+                "label": "13-week average occupancy unavailable",
+            })
+        elif monthly_signal and not weekly_signal:
+            for missing_field, label, required in [
+                ("avg_4wk_occupancy_pct", "4-week average occupancy unavailable", "weekly occupancy observations"),
+                ("avg_13wk_occupancy_pct", "13-week average occupancy unavailable", "13 weekly observations"),
+            ]:
+                facts.append({
+                    "field": missing_field,
+                    "value": None,
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "missing",
+                    "extraction_method": "excel_digest:derived_occupancy_average",
+                    "excerpt": f"Monthly occupancy observations found, but {label.lower()} requires {required}.",
+                    "cell_range": _cell_range_from_line(text),
+                    "period": {
+                        "coverage_status": "partial",
+                        "coverage_reason": f"Monthly occupancy observations found; {label.lower()} requires {required}.",
+                        "period_label": f"{len(values)} monthly occupancy observations",
+                        "observation_count": len(values),
+                    },
+                    "label": label,
+                })
         break
     return facts
 
@@ -871,6 +1007,7 @@ def extract_financial_facts_from_text(combined_text: str) -> list[dict[str, Any]
                     "extraction_method": "excel_digest:derived_financials",
                     "excerpt": line.strip()[:500],
                     "cell_range": _cell_range_from_line(line),
+                    "period": _infer_period_context(line, field, page["source_label"]),
                     "label": label,
                 })
                 seen.add(field)
@@ -1331,6 +1468,8 @@ def build_extracted_facts(
         occupancy["avg_13wk_pct"] = text_fact_by_field["avg_13wk_occupancy_pct"]["value"]
     if text_fact_by_field.get("avg_52wk_occupancy_pct") and not _present(occupancy.get("avg_52wk_pct")):
         occupancy["avg_52wk_pct"] = text_fact_by_field["avg_52wk_occupancy_pct"]["value"]
+    if text_fact_by_field.get("monthly_avg_occupancy_pct") and not _present(occupancy.get("monthly_avg_pct")):
+        occupancy["monthly_avg_pct"] = text_fact_by_field["monthly_avg_occupancy_pct"]["value"]
 
     centre = _ensure_dict(extracted, "centre")
     for source_field, centre_key in [
@@ -1390,6 +1529,7 @@ def build_extracted_facts(
         ("avg_4wk_occupancy_pct", _get(extracted, "occupancy", "avg_4wk_pct"), "extracted_json"),
         ("avg_13wk_occupancy_pct", _get(extracted, "occupancy", "avg_13wk_pct"), "extracted_json"),
         ("avg_52wk_occupancy_pct", _get(extracted, "occupancy", "avg_52wk_pct"), "extracted_json"),
+        ("monthly_avg_occupancy_pct", _get(extracted, "occupancy", "monthly_avg_pct"), "extracted_json"),
         ("fy23_avg_occupancy_pct", _get(extracted, "occupancy", "fy23_avg_pct"), "extracted_json"),
         ("fy24_avg_occupancy_pct", _get(extracted, "occupancy", "fy24_avg_pct"), "extracted_json"),
         ("fy25_avg_occupancy_pct", _get(extracted, "occupancy", "fy25_avg_pct"), "extracted_json"),
@@ -1432,6 +1572,7 @@ def build_extracted_facts(
             label_override=hint.get("label"),
             cell_range=hint.get("cell_range"),
             conflicts=conflicts_by_field.get(field),
+            period_context=hint.get("period") or _infer_period_context(hint.get("excerpt") or "", field, source_label),
         )
 
     for manual in manual_text_facts:

@@ -405,6 +405,88 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertTrue(workflow["evidence_readiness"]["manual_context"])
         self.assertTrue(workflow["partner_judgement_prompts"])
 
+    def test_ytd_financial_period_is_partial_review_required(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["management.xlsx"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== management.xlsx (pl_excel) ===\n"
+                "SHEET: Management Accounts YTD May25-Feb26\n"
+                "D23=Total revenue YTD | E23=900000\n"
+                "D30=Total Employment Costs YTD | E30=520000\n"
+                "D41=EBITDA YTD | E41=140000\n"
+            ),
+            source_files=["management.xlsx"],
+            file_classes={"management.xlsx": "pl_excel"},
+        )
+
+        revenue = next(f for f in workflow["facts"] if f["field"] == "revenue")
+        self.assertEqual(revenue["period"]["coverage_status"], "partial")
+        self.assertEqual(revenue["underwriting_use"], "review_required")
+        self.assertIn("YTD", revenue["period"]["coverage_reason"])
+
+    def test_template_payroll_is_excluded_from_underwriting(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["staffing-template.xlsx"], "missing_fields": ["payroll"]},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== staffing-template.xlsx (payroll_excel) ===\n"
+                "SHEET: Staffing Template\n"
+                "A1=Template payroll assumption | B1=Payroll | C1=620000\n"
+            ),
+            source_files=["staffing-template.xlsx"],
+            file_classes={"staffing-template.xlsx": "payroll_excel"},
+        )
+
+        payroll = next(f for f in workflow["facts"] if f["field"] == "payroll_labour_cost")
+        self.assertEqual(payroll["source_quality"], "template_or_forecast")
+        self.assertEqual(payroll["underwriting_use"], "excluded")
+        self.assertEqual(workflow["valuation_gate"]["status"], "blocked")
+
+    def test_monthly_occupancy_does_not_unlock_weekly_averages(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["occupancy.xlsx"], "missing_fields": ["occupancy_history"]},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000, "total_labour_cost": 550000}},
+                "occupancy": {},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== occupancy.xlsx (occupancy_excel) ===\n"
+                "SHEET: Output Occupancy\n"
+                "A1=Month | B1=Occupancy\n"
+                "A2=Jan | B2=0.80\n"
+                "A3=Feb | B3=0.82\n"
+                "A4=Mar | B4=0.84\n"
+                "A5=Apr | B5=0.86\n"
+            ),
+            source_files=["occupancy.xlsx"],
+            file_classes={"occupancy.xlsx": "occupancy_excel"},
+        )
+
+        fields = {f["field"]: f for f in workflow["facts"]}
+        self.assertIn("monthly_avg_occupancy_pct", fields)
+        self.assertIsNone(fields["avg_13wk_occupancy_pct"]["value"])
+        self.assertEqual(fields["avg_13wk_occupancy_pct"]["underwriting_use"], "blocked")
+        self.assertIn("13 weekly observations", fields["avg_13wk_occupancy_pct"]["period"]["coverage_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()
