@@ -33,7 +33,13 @@ app.add_middleware(
 
 MODEL      = "claude-sonnet-4-20250514"
 MAX_TOKENS = 12000
-API_RELEASE = "pipeline-retention-nonfatal-20260506"
+API_RELEASE = "document-extraction-hardening-20260507"
+API_FEATURES = {
+    "pdf_page_vision_fallback": True,
+    "excel_workbook_digest": True,
+    "vision_provider_diagnostics": True,
+    "market_audit_shell": True,
+}
 
 HIGH_VALUE_PAGE_KEYWORDS = (
     "profit and loss", "p&l", "income statement", "management accounts", "payroll",
@@ -1005,7 +1011,7 @@ class ReunderwriteRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "release": API_RELEASE}
+    return {"status": "ok", "release": API_RELEASE, "features": API_FEATURES}
 
 REUNDERWRITE_TEXT_BUDGET: dict[str, tuple[int, int]] = {
     'im_pdf':               (20000, 3),
