@@ -109,7 +109,10 @@ def _confidence(value: Any, data_quality: str | None = None) -> str:
 
 FIELD_META: dict[str, dict[str, str | None]] = {
     "centre_name": {"category": "centre", "label": "Centre name", "unit": None},
+    "trading_name": {"category": "centre", "label": "Trading name", "unit": None},
     "address": {"category": "centre", "label": "Address", "unit": None},
+    "suburb": {"category": "centre", "label": "Suburb", "unit": None},
+    "postcode": {"category": "centre", "label": "Postcode", "unit": None},
     "licensed_places": {"category": "centre", "label": "Licensed places", "unit": "places"},
     "nqs_rating": {"category": "regulatory", "label": "NQS rating", "unit": None},
     "current_occupancy_pct": {"category": "occupancy", "label": "Current occupancy / utilisation", "unit": "percent"},
@@ -163,6 +166,7 @@ def _add_fact(
     page: int | None = None,
     blocker: bool = False,
     label_override: str | None = None,
+    cell_range: str | None = None,
 ) -> None:
     evidence_id = f"ev_{_stable_token(field, source_label, page, excerpt, value)}"
     fact_id = f"fact_{_stable_token(field, value, evidence_id)}"
@@ -175,6 +179,14 @@ def _add_fact(
         "excerpt": excerpt,
         "evidence_id": evidence_id,
     }
+    if cell_range:
+        source["cell_range"] = cell_range
+    source_type = "workbook_derived" if extraction_method.startswith("excel_digest:derived") else (
+        "manual_user_note" if extraction_method == "manual_user_note" else "source_document"
+    )
+    derivation_note = None
+    if source_type == "workbook_derived":
+        derivation_note = "Derived from workbook digest rows/cells; review against the original spreadsheet before IC reliance."
     facts.append({
         "id": fact_id,
         "field": field,
@@ -189,6 +201,8 @@ def _add_fact(
         "status": "extracted" if confidence != "missing" else "needs_review",
         "blocker": blocker,
         "extraction_method": extraction_method,
+        "source_type": source_type,
+        "derivation_note": derivation_note,
         "evidence_id": evidence_id,
     })
     evidence.append({
@@ -200,7 +214,11 @@ def _add_fact(
         "excerpt": excerpt,
         "confidence": confidence,
         "extraction_method": extraction_method,
+        "source_type": source_type,
+        "derivation_note": derivation_note,
     })
+    if source.get("cell_range"):
+        evidence[-1]["cell_range"] = source.get("cell_range")
 
 
 def _iter_source_sections(combined_text: str) -> list[tuple[str, str, str]]:
@@ -280,6 +298,13 @@ def _cell_values_from_line(line: str) -> list[float]:
     return values
 
 
+def _cell_range_from_line(line: str) -> str | None:
+    refs = re.findall(r"\b([A-Z]{1,3}\d+)\s*=", line or "")
+    if not refs:
+        return None
+    return refs[0] if len(refs) == 1 else f"{refs[0]}:{refs[-1]}"
+
+
 def _money_from_line(line: str, prefer: str = "largest_abs") -> float | int | None:
     values = _cell_values_from_line(line)
     if not values:
@@ -301,6 +326,16 @@ def _money_from_line(line: str, prefer: str = "largest_abs") -> float | int | No
     else:
         chosen = max(values, key=abs)
     return int(chosen) if float(chosen).is_integer() else round(chosen, 2)
+
+
+def _similar_value(left: Any, right: Any) -> bool:
+    try:
+        l_val = float(left)
+        r_val = float(right)
+    except (TypeError, ValueError):
+        return str(left).strip().lower() == str(right).strip().lower()
+    tolerance = max(1.0, abs(l_val) * 0.01)
+    return abs(l_val - r_val) <= tolerance
 
 
 def _context_excerpt(text: str, start: int, end: int, radius: int = 120) -> str:
@@ -326,7 +361,10 @@ def _find_source_hint(field: str, value: Any, combined_text: str) -> dict[str, A
 
     keyword_map = {
         "centre_name": [r"centre", r"name"],
+        "trading_name": [r"trading", r"name"],
         "address": [r"address"],
+        "suburb": [r"suburb"],
+        "postcode": [r"postcode", r"post\s*code"],
         "licensed_places": [r"licensed", r"capacity", r"places", r"approved"],
         "nqs_rating": [r"nqs", r"rating"],
         "current_occupancy_pct": [r"current", r"utili[sz]ation", r"occupancy"],
@@ -574,6 +612,7 @@ def derive_occupancy_average_facts_from_text(combined_text: str) -> list[dict[st
                 "confidence": "medium",
                 "extraction_method": "excel_digest:derived_occupancy_average",
                 "excerpt": excerpt,
+                "cell_range": _cell_range_from_line(text),
                 "label": label,
             })
         break
@@ -655,12 +694,70 @@ def extract_financial_facts_from_text(combined_text: str) -> list[dict[str, Any]
                     "confidence": "medium",
                     "extraction_method": "excel_digest:derived_financials",
                     "excerpt": line.strip()[:500],
+                    "cell_range": _cell_range_from_line(line),
                     "label": label,
                 })
                 seen.add(field)
                 break
         if {"revenue", "payroll_labour_cost", "rent_pa", "ebitda"}.issubset(seen):
             break
+    return facts
+
+
+def extract_identity_facts_from_text(combined_text: str) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    specs = [
+        (
+            "trading_name",
+            re.compile(r"\b(?:trading\s+name|business\s+name|approved\s+provider\s+name)\b\s*[:\-]?\s*(?P<value>[A-Z0-9][A-Za-z0-9 &'().,\-]{2,120})", re.IGNORECASE),
+            "Trading name",
+        ),
+        (
+            "centre_name",
+            re.compile(r"\b(?:service\s+name|centre\s+name|center\s+name)\b\s*[:\-]?\s*(?P<value>[A-Z0-9][A-Za-z0-9 &'().,\-]{2,120})", re.IGNORECASE),
+            "Centre name",
+        ),
+        (
+            "address",
+            re.compile(r"\b(?:address|premises|property)\b\s*[:\-]?\s*(?P<value>\d{1,5}\s+[A-Za-z0-9 &'().,\-/]{5,160})", re.IGNORECASE),
+            "Address",
+        ),
+        (
+            "suburb",
+            re.compile(r"\bsuburb\b\s*[:\-]?\s*(?P<value>[A-Za-z][A-Za-z '\-]{2,80})", re.IGNORECASE),
+            "Suburb",
+        ),
+        (
+            "postcode",
+            re.compile(r"\b(?:postcode|post\s*code)\b\s*[:\-]?\s*(?P<value>\d{4})\b", re.IGNORECASE),
+            "Postcode",
+        ),
+    ]
+    seen: set[str] = set()
+    for page in _iter_source_pages(combined_text):
+        for line in _line_windows(page["text"]):
+            for field, pattern, label in specs:
+                if field in seen:
+                    continue
+                match = pattern.search(line)
+                if not match:
+                    continue
+                value = re.sub(r"\s+", " ", match.group("value")).strip(" .,:;-")
+                if field == "postcode" and not re.fullmatch(r"\d{4}", value):
+                    continue
+                facts.append({
+                    "field": field,
+                    "value": value,
+                    "source_label": page["source_label"],
+                    "page": page["page"],
+                    "confidence": "medium",
+                    "extraction_method": f"regex:supplemental_identity:{page['source_class']}",
+                    "excerpt": line.strip()[:500],
+                    "cell_range": _cell_range_from_line(line),
+                    "label": label,
+                })
+                seen.add(field)
+                break
     return facts
 
 
@@ -971,8 +1068,9 @@ def build_extracted_facts(
     occupancy_text_facts = extract_occupancy_facts_from_text(combined_text)
     support_text_facts = extract_missing_field_support_from_text(combined_text)
     financial_text_facts = extract_financial_facts_from_text(combined_text)
+    identity_text_facts = extract_identity_facts_from_text(combined_text)
     text_fact_by_field: dict[str, dict[str, Any]] = {}
-    for fact in [*occupancy_text_facts, *support_text_facts, *financial_text_facts]:
+    for fact in [*occupancy_text_facts, *support_text_facts, *financial_text_facts, *identity_text_facts]:
         text_fact_by_field.setdefault(fact["field"], fact)
 
     occupancy = _ensure_dict(extracted, "occupancy")
@@ -988,26 +1086,56 @@ def build_extracted_facts(
         occupancy["avg_52wk_pct"] = text_fact_by_field["avg_52wk_occupancy_pct"]["value"]
 
     centre = _ensure_dict(extracted, "centre")
+    for source_field, centre_key in [
+        ("centre_name", "name"),
+        ("trading_name", "trading_name"),
+        ("address", "address"),
+        ("suburb", "suburb"),
+        ("postcode", "postcode"),
+    ]:
+        if text_fact_by_field.get(source_field) and not _present(centre.get(centre_key)):
+            centre[centre_key] = text_fact_by_field[source_field]["value"]
     if text_fact_by_field.get("licensed_places") and not _present(centre.get("licensed_places")):
         centre["licensed_places"] = text_fact_by_field["licensed_places"]["value"]
     financials = _ensure_dict(extracted, "financials")
     fy25 = _ensure_dict(financials, "fy25")
+    meta = extracted.setdefault("meta", {})
+    if not isinstance(meta.get("workbook_derived_conflicts"), list):
+        meta["workbook_derived_conflicts"] = []
+
+    def apply_financial_text_fact(field: str, target_key: str) -> None:
+        fact = text_fact_by_field.get(field)
+        if not fact:
+            return
+        current = fy25.get(target_key)
+        if _present(current) and not _similar_value(current, fact["value"]):
+            meta["workbook_derived_conflicts"].append({
+                "field": field,
+                "existing_value": current,
+                "workbook_derived_value": fact["value"],
+                "source_label": fact.get("source_label"),
+                "cell_range": fact.get("cell_range"),
+                "excerpt": fact.get("excerpt"),
+                "resolution": "workbook_derived_value_preferred_for_financial_reunderwriting",
+            })
+        if not _present(current) or not _similar_value(current, fact["value"]):
+            fy25[target_key] = fact["value"]
+
     if text_fact_by_field.get("rent_pa") and not _present(fy25.get("rent_pa")):
         fy25["rent_pa"] = text_fact_by_field["rent_pa"]["value"]
-    if text_fact_by_field.get("revenue") and not _present(fy25.get("revenue")):
-        fy25["revenue"] = text_fact_by_field["revenue"]["value"]
-    if text_fact_by_field.get("payroll_labour_cost") and not _present(fy25.get("total_labour_cost")):
-        fy25["total_labour_cost"] = text_fact_by_field["payroll_labour_cost"]["value"]
-    if text_fact_by_field.get("ebitda") and not _present(fy25.get("ebitda")):
-        fy25["ebitda"] = text_fact_by_field["ebitda"]["value"]
-    if text_fact_by_field.get("normalised_ebitda") and not _present(fy25.get("normalised_ebitda")):
-        fy25["normalised_ebitda"] = text_fact_by_field["normalised_ebitda"]["value"]
+    apply_financial_text_fact("revenue", "revenue")
+    apply_financial_text_fact("payroll_labour_cost", "total_labour_cost")
+    apply_financial_text_fact("ebitda", "ebitda")
+    apply_financial_text_fact("normalised_ebitda", "normalised_ebitda")
     if text_fact_by_field.get("asking_price") and not _present(_get(extracted, "financials", "asking_price")):
         financials["asking_price"] = text_fact_by_field["asking_price"]["value"]
 
     field_specs = [
         ("centre_name", _get(extracted, "centre", "name"), "extracted_json"),
+        ("trading_name", _get(extracted, "centre", "trading_name"), "extracted_json"),
         ("address", _get(extracted, "centre", "address"), "extracted_json"),
+        ("suburb", _get(extracted, "centre", "suburb"), "extracted_json"),
+        ("postcode", _get(extracted, "centre", "postcode"), "extracted_json"),
         ("licensed_places", _get(extracted, "centre", "licensed_places"), "extracted_json"),
         ("nqs_rating", _get(extracted, "centre", "nqs_rating"), "extracted_json"),
         ("current_occupancy_pct", _get(extracted, "occupancy", "current_month_pct"), "extracted_json"),
@@ -1043,6 +1171,7 @@ def build_extracted_facts(
             page=hint.get("page"),
             blocker=field in {"revenue", "ebitda", "payroll_labour_cost"} and confidence == "missing",
             label_override=hint.get("label"),
+            cell_range=hint.get("cell_range"),
         )
 
     fee_facts = extract_fee_facts_from_text(combined_text)
@@ -1087,6 +1216,11 @@ def build_missing_fields(extracted: dict[str, Any], extracted_facts: list[dict[s
         "ebitda": ["ebitda", "profit"],
         "normalised_ebitda": ["normalised_ebitda", "normalized_ebitda"],
         "payroll_labour_cost": ["payroll", "labour", "labor", "wages", "employment_cost"],
+        "trading_name": ["trading_name", "trading name", "business_name"],
+        "centre_name": ["centre_name", "center_name", "service_name"],
+        "address": ["address", "property_address", "premises"],
+        "suburb": ["suburb"],
+        "postcode": ["postcode", "post_code", "post code"],
         "licensed_places": ["licensed_places", "licensed capacity", "capacity", "approved_places"],
         "asking_price": ["asking_price", "business_price", "purchase_price", "sale_price"],
         "current_occupancy_pct": ["current_occupancy", "current_utilisation", "current_utilization"],
@@ -1179,6 +1313,23 @@ def build_structured_deal_intelligence(
             "field": "fees",
             "linked_fact_ids": [f["id"] for f in fee_workflow_facts if f.get("id")],
             "linked_evidence_ids": [f["evidence_id"] for f in fee_workflow_facts if f.get("evidence_id")],
+        })
+    workbook_conflicts = _as_list(_get(extracted, "meta", "workbook_derived_conflicts"))
+    if workbook_conflicts:
+        extraction_warnings.append({
+            "id": "workbook_financial_conflicts",
+            "severity": "warning",
+            "message": "Workbook-derived financial evidence conflicted with an existing extracted value; workbook evidence was preferred and should be reviewed.",
+            "field": "financials",
+            "conflicts": workbook_conflicts[:10],
+            "linked_fact_ids": [
+                f["id"] for f in extracted_facts
+                if f.get("source_type") == "workbook_derived" and f.get("field") in {str(c.get("field")) for c in workbook_conflicts if isinstance(c, dict)}
+            ],
+            "linked_evidence_ids": [
+                f["evidence_id"] for f in extracted_facts
+                if f.get("source_type") == "workbook_derived" and f.get("field") in {str(c.get("field")) for c in workbook_conflicts if isinstance(c, dict)}
+            ],
         })
     vision_failed_pages = _vision_failure_pages(combined_text)
     if vision_failed_pages:

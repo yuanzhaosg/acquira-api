@@ -280,8 +280,69 @@ class DocumentExtractionTests(unittest.TestCase):
         self.assertEqual(fields["rent_pa"]["value"], 110000)
         self.assertEqual(fields["normalised_ebitda"]["value"], 210000)
         self.assertEqual(fields["avg_4wk_occupancy_pct"]["value"], 85)
+        self.assertEqual(fields["revenue"]["source_type"], "workbook_derived")
+        self.assertEqual(fields["revenue"]["source"]["cell_range"], "D23:F23")
+        self.assertIn("Derived from workbook digest", fields["revenue"]["derivation_note"])
         self.assertEqual(workflow["valuation_gate"]["required_evidence"]["occupancy_history"], True)
         self.assertNotIn("occupancy_history", [str(field).lower() for field in workflow["missing_fields"]])
+
+    def test_workbook_derived_financials_prefer_workbook_and_flag_conflict(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["im.pdf", "databook.xlsx"], "missing_fields": []},
+                "centre": {"name": "Synthetic Childcare"},
+                "financials": {"fy25": {"revenue": 900000, "ebitda": 100000, "total_labour_cost": 400000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Synthetic Childcare"},
+            combined_text=(
+                "=== databook.xlsx (pl_excel) ===\n"
+                "SHEET: Adjusted Actuals\n"
+                "D23=Total revenue | E23=1200000\n"
+                "D30=Total Employment Costs | E30=620000\n"
+                "D41=EBITDA | E41=210000\n"
+            ),
+            source_files=["im.pdf", "databook.xlsx"],
+            file_classes={"im.pdf": "im_pdf", "databook.xlsx": "pl_excel"},
+        )
+
+        fields = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(fields["revenue"]["value"], 1200000)
+        self.assertEqual(fields["payroll_labour_cost"]["value"], 620000)
+        self.assertTrue(any(warning["id"] == "workbook_financial_conflicts" for warning in workflow["extraction_warnings"]))
+
+    def test_supplemental_documents_populate_identity_fields(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "meta": {"source_files": ["approval.pdf"], "missing_fields": ["trading_name", "address", "suburb", "postcode"]},
+                "centre": {},
+                "financials": {"fy25": {"revenue": 1000000, "ebitda": 200000, "total_labour_cost": 550000}},
+                "occupancy": {"avg_4wk_pct": 80, "avg_13wk_pct": 81},
+                "lease": {},
+                "fees": {},
+            },
+            scored={"centre_name": "Fallback Centre"},
+            combined_text=(
+                "=== provider approval.pdf (service_approval_pdf) ===\n"
+                "--- Page 2 ---\n"
+                "Trading name: Jenny's Early Learning Norlane\n"
+                "Service name: Jenny's Norlane Childcare\n"
+                "Address: 12 Station Street, Norlane VIC 3214\n"
+                "Suburb: Norlane\n"
+                "Postcode: 3214\n"
+            ),
+            source_files=["approval.pdf"],
+            file_classes={"approval.pdf": "service_approval_pdf"},
+        )
+
+        fields = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(fields["trading_name"]["value"], "Jenny's Early Learning Norlane")
+        self.assertEqual(fields["address"]["source"]["page"], 2)
+        self.assertEqual(fields["suburb"]["value"], "Norlane")
+        self.assertEqual(fields["postcode"]["value"], "3214")
+        self.assertNotIn("postcode", [str(field).lower() for field in workflow["missing_fields"]])
 
     def test_manual_evidence_notes_are_low_confidence_and_redacted(self):
         text = main.manual_evidence_text([
