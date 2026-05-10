@@ -186,6 +186,7 @@ RULES:
 12. Return all numbers as plain JSON numbers. Never use a leading + sign.
 13. labour_ratio_pct >100 or <20 is almost certainly an error - recheck and set to null if unresolvable.
 14. GREENFIELD / PRE-OPENING RULE: If the document describes a brand-new, turn-key, approaching-OC, not-yet-operating, AFL assignment, or lease assignment centre, classify it as greenfield_pre_opening in meta.source_type. Do NOT treat pro-forma EBITDA as actual FY25 EBITDA. Historical occupancy, labour ratio, NQS, and actual EBITDA should remain null unless explicitly provided. Put vendor forecast/pro-forma EBITDA values in meta.anomalies and/or pipeline_mentions rather than fy25.ebitda.
+15. SA3 RULE: Extract centre.sa3_code and centre.sa3_name only if a source explicitly states the Statistical Area 3 / SA3 code or name. Do not infer SA3 from address, suburb, postcode, LGA, or state. If absent, leave both fields null.
 
 VIC-SPECIFIC CONTEXT:
 - VKF (Vic Kinder Funding) = State Government kindergarten subsidy, counted as revenue.
@@ -217,7 +218,7 @@ Return this exact JSON structure (set fields to null if not found):
   },
   "centre": {
     "name": null, "trading_name": null, "address": null, "suburb": null,
-    "state": null, "postcode": null, "lga": null, "operator": null,
+    "state": null, "postcode": null, "sa3_code": null, "sa3_name": null, "lga": null, "operator": null,
     "operator_type": "unknown", "licensed_places": null, "nqs_rating": null,
     "nqs_date": null, "service_approval_number": null
   },

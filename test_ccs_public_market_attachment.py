@@ -168,6 +168,70 @@ class CcsPublicMarketAttachmentTests(unittest.TestCase):
         self.assertNotIn("public_market_benchmark", workflow)
         self.assertEqual(workflow["market_audit"]["public_market_benchmark"]["sa3_code"], "21104")
 
+    def test_structured_deal_preserves_explicit_sa3_fields_as_facts(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "centre": {
+                    "name": "Whitehorse Fixture",
+                    "sa3_code": "21104",
+                    "sa3_name": "Whitehorse - East",
+                    "postcode": "3131",
+                    "licensed_places": 55,
+                },
+                "meta": {"missing_fields": []},
+            },
+            scored={"centre_name": "Whitehorse Fixture", "total_score": 50, "deal_breaker_flags": {"flags": []}},
+            combined_text="SA3 code: 21104\nSA3 name: Whitehorse - East\nPostcode: 3131",
+            source_files=["qa.txt"],
+            file_classes={"qa.txt": "qa_fixture"},
+        )
+
+        facts_by_field = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(facts_by_field["sa3_code"]["value"], "21104")
+        self.assertEqual(facts_by_field["sa3_name"]["value"], "Whitehorse - East")
+
+    def test_structured_deal_extracts_only_explicit_sa3_from_source_text(self):
+        extracted = {
+            "centre": {
+                "name": "Whitehorse Fixture",
+                "postcode": "3131",
+                "licensed_places": 55,
+            },
+            "meta": {"missing_fields": []},
+        }
+        workflow = build_structured_deal_intelligence(
+            extracted=extracted,
+            scored={"centre_name": "Whitehorse Fixture", "total_score": 50, "deal_breaker_flags": {"flags": []}},
+            combined_text="SA3 code: 21104\nSA3 name: Whitehorse - East\nPostcode: 3131",
+            source_files=["qa.txt"],
+            file_classes={"qa.txt": "qa_fixture"},
+        )
+
+        self.assertEqual(extracted["centre"]["sa3_code"], "21104")
+        self.assertEqual(extracted["centre"]["sa3_name"], "Whitehorse - East")
+        facts_by_field = {fact["field"]: fact for fact in workflow["facts"]}
+        self.assertEqual(facts_by_field["sa3_code"]["extraction_method"], "regex:supplemental_identity:unknown")
+        self.assertEqual(facts_by_field["sa3_name"]["extraction_method"], "regex:supplemental_identity:unknown")
+
+    def test_postcode_alone_does_not_attach_public_market_benchmark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workbook_path = Path(tmp) / "ccs.xlsx"
+            make_synthetic_workbook(workbook_path)
+            load_ccs_public_market_benchmark_from_env.cache_clear()
+            with patch.dict(os.environ, {
+                "ACQUIRA_CCS_WORKBOOK_PATH": str(workbook_path),
+                "ACQUIRA_CCS_QUARTER": "Dec 2025",
+            }, clear=True):
+                audit = {"warnings": []}
+                attached = attach_ccs_public_market_benchmark_from_env(
+                    {"centre": {"postcode": "3131", "suburb": "Forest Hill"}},
+                    audit,
+                )
+
+        self.assertEqual(attached, audit)
+        self.assertNotIn("public_market_benchmark", attached)
+        self.assertNotIn("local_demand_supply", attached)
+
 
 if __name__ == "__main__":
     unittest.main()

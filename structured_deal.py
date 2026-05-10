@@ -376,6 +376,8 @@ FIELD_META: dict[str, dict[str, str | None]] = {
     "address": {"category": "centre", "label": "Address", "unit": None},
     "suburb": {"category": "centre", "label": "Suburb", "unit": None},
     "postcode": {"category": "centre", "label": "Postcode", "unit": None},
+    "sa3_code": {"category": "centre", "label": "SA3 code", "unit": None},
+    "sa3_name": {"category": "centre", "label": "SA3 name", "unit": None},
     "licensed_places": {"category": "centre", "label": "Licensed places", "unit": "places"},
     "nqs_rating": {"category": "regulatory", "label": "NQS rating", "unit": None},
     "current_occupancy_pct": {"category": "occupancy", "label": "Current occupancy / utilisation", "unit": "percent"},
@@ -680,6 +682,8 @@ def _find_source_hint(field: str, value: Any, combined_text: str) -> dict[str, A
         "address": [r"address"],
         "suburb": [r"suburb"],
         "postcode": [r"postcode", r"post\s*code"],
+        "sa3_code": [r"sa3", r"statistical\s+area\s+3", r"code"],
+        "sa3_name": [r"sa3", r"statistical\s+area\s+3", r"name", r"area"],
         "licensed_places": [r"licensed", r"capacity", r"places", r"approved"],
         "nqs_rating": [r"nqs", r"rating"],
         "current_occupancy_pct": [r"current", r"utili[sz]ation", r"occupancy"],
@@ -1188,6 +1192,16 @@ def extract_identity_facts_from_text(combined_text: str) -> list[dict[str, Any]]
             re.compile(r"\b(?:postcode|post\s*code)\b\s*[:\-]?\s*(?P<value>\d{4})\b", re.IGNORECASE),
             "Postcode",
         ),
+        (
+            "sa3_code",
+            re.compile(r"\b(?:sa3|statistical\s+area\s+3)\s*(?:code)?\b\s*[:\-]?\s*(?P<value>\d{5})\b", re.IGNORECASE),
+            "SA3 code",
+        ),
+        (
+            "sa3_name",
+            re.compile(r"\b(?:sa3\s+(?:name|area)|statistical\s+area\s+3\s+(?:name|area)?)\b\s*[:\-]?\s*(?P<value>[A-Za-z][A-Za-z0-9 &'().,\-/]{2,100})", re.IGNORECASE),
+            "SA3 name",
+        ),
     ]
     seen: set[str] = set()
     for page in _iter_source_pages(combined_text):
@@ -1200,6 +1214,10 @@ def extract_identity_facts_from_text(combined_text: str) -> list[dict[str, Any]]
                     continue
                 value = re.sub(r"\s+", " ", match.group("value")).strip(" .,:;-")
                 if field == "postcode" and not re.fullmatch(r"\d{4}", value):
+                    continue
+                if field == "sa3_code" and not re.fullmatch(r"\d{5}", value):
+                    continue
+                if field == "sa3_name" and re.fullmatch(r"\d+", value):
                     continue
                 facts.append({
                     "field": field,
@@ -1696,6 +1714,8 @@ def build_extracted_facts(
         ("address", "address"),
         ("suburb", "suburb"),
         ("postcode", "postcode"),
+        ("sa3_code", "sa3_code"),
+        ("sa3_name", "sa3_name"),
     ]:
         if text_fact_by_field.get(source_field) and not _present(centre.get(centre_key)):
             centre[centre_key] = text_fact_by_field[source_field]["value"]
@@ -1759,6 +1779,12 @@ def build_extracted_facts(
         ("asking_price", _get(extracted, "financials", "asking_price") or _get(extracted, "key_ratios", "asking_price"), "extracted_json"),
         ("lease_expiry", _get(extracted, "lease", "expiry_date"), "extracted_json"),
     ]
+    sa3_code_value = _get(extracted, "centre", "sa3_code") or _get(extracted, "location", "sa3_code") or _get(extracted, "market", "sa3_code") or _get(extracted, "demographics", "sa3_code")
+    sa3_name_value = _get(extracted, "centre", "sa3_name") or _get(extracted, "location", "sa3_name") or _get(extracted, "market", "sa3_name") or _get(extracted, "demographics", "sa3_name")
+    if _present(sa3_code_value):
+        field_specs.append(("sa3_code", sa3_code_value, "extracted_json"))
+    if _present(sa3_name_value):
+        field_specs.append(("sa3_name", sa3_name_value, "extracted_json"))
     conflicts_by_field: dict[str, list[dict[str, Any]]] = {}
     for conflict in _as_list(_get(extracted, "meta", "workbook_derived_conflicts")):
         if isinstance(conflict, dict):
