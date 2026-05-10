@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from demand_service import build_market_audit  # noqa: E402
 from local_demand_supply import compute_local_demand_supply  # noqa: E402
+from structured_deal import build_structured_deal_intelligence  # noqa: E402
 
 
 PUBLIC_MARKET_BENCHMARK = {
@@ -136,6 +137,54 @@ def build_forest_hill_market_audit_sample() -> dict[str, Any]:
     )
 
 
+def build_forest_hill_report_payload_sample() -> dict[str, Any]:
+    market_audit = build_forest_hill_market_audit_sample()
+    pipeline_audit = {
+        "source_type": "manual_structured",
+        "searched": True,
+        "search_required": False,
+        "approved_places": 80,
+        "lodged_places": 120,
+        "risk_adjusted_places": 48,
+        "confidence": "medium",
+        "warnings": [],
+    }
+    extracted = {
+        "centre": {
+            "name": "Forest Hill Fixture ELC",
+            "address": "303 Springvale Rd, Forest Hill VIC 3131",
+            "suburb": "Forest Hill",
+            "state": "VIC",
+            "postcode": "3131",
+            "licensed_places": 55,
+        },
+        "financials": {"fy25": {"revenue": 1576862, "ebitda": 407682}},
+        "key_ratios": {"licensed_places": 55, "revenue_fy25": 1576862, "ebitda_fy25": 407682},
+        "occupancy": {"current_month_pct": 60},
+        "_market_audit": market_audit,
+        "_pipeline_audit": pipeline_audit,
+        "_pipeline_projects": [],
+        "meta": {"missing_fields": ["asking_price"]},
+    }
+    scored = {
+        "centre_name": "Forest Hill Fixture ELC",
+        "total_score": 55,
+        "verdict": {"category": "turnaround", "one_liner": "QA fixture only."},
+        "deal_breaker_flags": {"flags": []},
+        "market_audit": market_audit,
+        "pipeline_audit": pipeline_audit,
+        "pipeline_projects": [],
+    }
+    workflow = build_structured_deal_intelligence(
+        extracted=extracted,
+        scored=scored,
+        combined_text="QA fixture payload for public aggregate market evidence inspection.",
+        source_files=["qa_public_market_context_fixture.json"],
+        file_classes={"qa_public_market_context_fixture.json": "qa_fixture"},
+    )
+    return {"extracted": extracted, "scored": scored, "workflow": workflow}
+
+
 def validate_sample_market_audit(audit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if "public_market_benchmark" not in audit:
@@ -166,15 +215,32 @@ def validate_sample_market_audit(audit: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_report_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    workflow = payload.get("workflow") if isinstance(payload, dict) else None
+    if not isinstance(workflow, dict):
+        return ["workflow missing from report payload"]
+    market_audit = workflow.get("market_audit")
+    if not isinstance(market_audit, dict):
+        return ["workflow.market_audit missing from report payload"]
+    errors.extend(validate_sample_market_audit(market_audit))
+    if "public_market_benchmark" in workflow:
+        errors.append("public_market_benchmark should live under workflow.market_audit")
+    if "local_demand_supply" in workflow:
+        errors.append("local_demand_supply should live under workflow.market_audit")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Forest Hill public market context QA JSON.")
     parser.add_argument("--out", help="Optional path to write JSON output.")
     parser.add_argument("--check", action="store_true", help="Validate the generated sample before writing.")
+    parser.add_argument("--report-payload", action="store_true", help="Generate a report-style payload with workflow.market_audit context.")
     args = parser.parse_args()
 
-    sample = build_forest_hill_market_audit_sample()
+    sample = build_forest_hill_report_payload_sample() if args.report_payload else build_forest_hill_market_audit_sample()
     if args.check:
-        errors = validate_sample_market_audit(sample)
+        errors = validate_report_payload(sample) if args.report_payload else validate_sample_market_audit(sample)
         if errors:
             for error in errors:
                 print(error, file=sys.stderr)

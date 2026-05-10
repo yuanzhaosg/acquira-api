@@ -2,6 +2,8 @@ import unittest
 
 from scripts.qa_public_market_context import (
     build_forest_hill_market_audit_sample,
+    build_forest_hill_report_payload_sample,
+    validate_report_payload,
     validate_sample_market_audit,
 )
 
@@ -61,6 +63,19 @@ class PublicMarketContextQaTests(unittest.TestCase):
         sample = build_forest_hill_market_audit_sample()
 
         self.assertEqual(validate_sample_market_audit(sample), [])
+
+    def test_report_payload_places_public_context_under_workflow_market_audit(self):
+        payload = build_forest_hill_report_payload_sample()
+        workflow = payload["workflow"]
+        market_audit = workflow["market_audit"]
+
+        self.assertIn("public_market_benchmark", market_audit)
+        self.assertIn("local_demand_supply", market_audit)
+        self.assertNotIn("public_market_benchmark", workflow)
+        self.assertNotIn("local_demand_supply", workflow)
+        self.assertEqual(market_audit["public_market_benchmark"]["sa3_code"], "21104")
+        self.assertEqual(market_audit["local_demand_supply"]["market_capacity_signal"], "stretched")
+        self.assertEqual(validate_report_payload(payload), [])
 
 
 if __name__ == "__main__":
