@@ -33,7 +33,7 @@ app.add_middleware(
 
 MODEL      = "claude-sonnet-4-20250514"
 MAX_TOKENS = 12000
-API_RELEASE = "document-extraction-hardening-20260507"
+API_RELEASE = "ccs-public-market-context-20260510"
 API_FEATURES = {
     "pdf_page_vision_fallback": True,
     "excel_workbook_digest": True,
