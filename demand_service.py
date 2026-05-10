@@ -897,6 +897,121 @@ def market_position_score(
     }
 
 
+PUBLIC_MARKET_BENCHMARK_FIELDS = (
+    "source",
+    "source_quality",
+    "as_of_quarter",
+    "sa3_code",
+    "sa3_name",
+    "children_0_5_using_care",
+    "children_6_plus_using_care",
+    "total_children_using_care",
+    "families_using_care",
+    "all_approved_services",
+    "cbdc_services",
+    "children_0_5_per_cbdc_service",
+    "total_children_per_all_service",
+    "cbdc_density_per_1000_children_0_5",
+    "cbdc_mean_fee_per_hour",
+    "cbdc_fee_growth_yoy_pct",
+    "cbdc_services_above_cap_pct",
+    "caveats",
+    "underwriting_use",
+    "not_underwriting_use",
+)
+
+
+LOCAL_DEMAND_SUPPLY_FIELDS = (
+    "sa3_ccs_participation_rate_0_5",
+    "estimated_realised_ccs_demand_0_5",
+    "current_cbdc_approved_places",
+    "current_child_per_place",
+    "proposed_new_places",
+    "post_entry_child_per_place",
+    "supply_dilution_pct",
+    "future_supply_places",
+    "future_child_per_place",
+    "market_capacity_signal",
+    "market_capacity_confidence",
+    "signal_reasons",
+    "caveats",
+    "evidence_ledger_entry",
+)
+
+
+LOCAL_DEMAND_SUPPLY_REQUIRED_FIELDS = (
+    "estimated_realised_ccs_demand_0_5",
+    "current_cbdc_approved_places",
+    "current_child_per_place",
+    "market_capacity_signal",
+)
+
+
+PUBLIC_MARKET_CONTEXT_UNAVAILABLE_CAVEATS = [
+    "Public market benchmark inputs were not supplied for this market audit.",
+    "No CCS-derived market benchmark was used in the existing market score.",
+]
+
+
+LOCAL_DEMAND_SUPPLY_UNAVAILABLE_CAVEATS = [
+    "Local demand-supply inputs were not supplied for this market audit.",
+    "No local demand-supply screen was used in the existing market score.",
+]
+
+
+def _copy_allowed_fields(source: dict | None, allowed_fields: tuple[str, ...]) -> dict:
+    if not isinstance(source, dict):
+        return {}
+    return {field: source.get(field) for field in allowed_fields if field in source}
+
+
+def _local_demand_supply_is_available(local_demand_supply: dict | None) -> bool:
+    if not isinstance(local_demand_supply, dict) or not local_demand_supply:
+        return False
+    return any(local_demand_supply.get(field) is not None for field in LOCAL_DEMAND_SUPPLY_REQUIRED_FIELDS)
+
+
+def attach_optional_public_market_context(
+    audit: dict,
+    *,
+    public_market_benchmark: dict | None = None,
+    local_demand_supply: dict | None = None,
+) -> dict:
+    """
+    Attach already-computed public market context without changing audit scoring.
+
+    The helpers here intentionally do not parse workbooks, call geocoders, or
+    influence the existing market score. They only make optional benchmark/model
+    objects available for backend JSON inspection.
+    """
+    attached = dict(audit)
+
+    if public_market_benchmark is not None:
+        benchmark = _copy_allowed_fields(public_market_benchmark, PUBLIC_MARKET_BENCHMARK_FIELDS)
+        if benchmark:
+            attached["public_market_benchmark"] = benchmark
+        else:
+            attached["public_market_benchmark"] = {
+                "status": "unavailable",
+                "reason": "Public market benchmark inputs were not supplied.",
+                "caveats": list(PUBLIC_MARKET_CONTEXT_UNAVAILABLE_CAVEATS),
+            }
+
+    if local_demand_supply is not None:
+        model = _copy_allowed_fields(local_demand_supply, LOCAL_DEMAND_SUPPLY_FIELDS)
+        if _local_demand_supply_is_available(model):
+            attached["local_demand_supply"] = model
+        else:
+            attached["local_demand_supply"] = {
+                "status": "unavailable",
+                "reason": "Local demand-supply model inputs were not supplied.",
+                "caveats": list(LOCAL_DEMAND_SUPPLY_UNAVAILABLE_CAVEATS),
+                "signal_reasons": ["Local demand-supply model unavailable because required inputs were not supplied."],
+            }
+
+    return attached
+
+
 def build_market_audit(
     demand_context: dict | None,
     market_context: dict | None,
@@ -909,6 +1024,8 @@ def build_market_audit(
     pipeline_audit: dict | None = None,
     vendor_kids_0_4: int | None = None,
     competitor_supply: dict | None = None,
+    public_market_benchmark: dict | None = None,
+    local_demand_supply: dict | None = None,
 ) -> dict:
     """
     Investor-facing audit trail for the deterministic market model.
@@ -1037,4 +1154,8 @@ def build_market_audit(
     }
     if competitor_supply:
         audit["competitor_supply"] = competitor_supply
-    return audit
+    return attach_optional_public_market_context(
+        audit,
+        public_market_benchmark=public_market_benchmark,
+        local_demand_supply=local_demand_supply,
+    )
