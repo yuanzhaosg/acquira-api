@@ -35,7 +35,7 @@ app.add_middleware(
 
 MODEL      = "claude-sonnet-4-20250514"
 MAX_TOKENS = 12000
-API_RELEASE = "ccs-public-market-benchmark-attach-20260511"
+API_RELEASE = "ccs-explicit-sa3-benchmark-20260511"
 API_FEATURES = {
     "pdf_page_vision_fallback": True,
     "excel_workbook_digest": True,
