@@ -139,6 +139,7 @@ def build_forest_hill_market_audit_sample() -> dict[str, Any]:
 
 def build_forest_hill_report_payload_sample() -> dict[str, Any]:
     market_audit = build_forest_hill_market_audit_sample()
+    market_audit.pop("local_demand_supply", None)
     pipeline_audit = {
         "source_type": "manual_structured",
         "searched": True,
@@ -185,12 +186,10 @@ def build_forest_hill_report_payload_sample() -> dict[str, Any]:
     return {"extracted": extracted, "scored": scored, "workflow": workflow}
 
 
-def validate_sample_market_audit(audit: dict[str, Any]) -> list[str]:
+def validate_sample_market_audit(audit: dict[str, Any], *, require_local_demand_supply: bool = True) -> list[str]:
     errors: list[str] = []
     if "public_market_benchmark" not in audit:
         errors.append("public_market_benchmark missing")
-    if "local_demand_supply" not in audit:
-        errors.append("local_demand_supply missing")
     for field in ("edr", "warnings", "competitor_count", "pipeline_places"):
         if field not in audit:
             errors.append(f"existing market audit field missing: {field}")
@@ -198,14 +197,16 @@ def validate_sample_market_audit(audit: dict[str, Any]) -> list[str]:
         errors.append("public market benchmark was placed under target/deal facts")
     benchmark = audit.get("public_market_benchmark") or {}
     model = audit.get("local_demand_supply") or {}
+    if require_local_demand_supply and "local_demand_supply" not in audit:
+        errors.append("local_demand_supply missing")
     if not benchmark.get("caveats"):
         errors.append("public_market_benchmark caveats missing")
-    if not model.get("caveats"):
+    if require_local_demand_supply and not model.get("caveats"):
         errors.append("local_demand_supply caveats missing")
     if "target_occupancy" not in (benchmark.get("not_underwriting_use") or []):
         errors.append("public_market_benchmark not_underwriting_use missing target_occupancy")
     ledger_not_use = ((model.get("evidence_ledger_entry") or {}).get("not_underwriting_use") or [])
-    if "target_revenue" not in ledger_not_use:
+    if require_local_demand_supply and "target_revenue" not in ledger_not_use:
         errors.append("local_demand_supply not_underwriting_use missing target_revenue")
 
     text = json.dumps(audit).lower()
@@ -223,11 +224,13 @@ def validate_report_payload(payload: dict[str, Any]) -> list[str]:
     market_audit = workflow.get("market_audit")
     if not isinstance(market_audit, dict):
         return ["workflow.market_audit missing from report payload"]
-    errors.extend(validate_sample_market_audit(market_audit))
+    errors.extend(validate_sample_market_audit(market_audit, require_local_demand_supply=False))
     if "public_market_benchmark" in workflow:
         errors.append("public_market_benchmark should live under workflow.market_audit")
     if "local_demand_supply" in workflow:
         errors.append("local_demand_supply should live under workflow.market_audit")
+    if "local_demand_supply" in market_audit:
+        errors.append("local_demand_supply should not be attached by the CCS benchmark report payload")
     return errors
 
 

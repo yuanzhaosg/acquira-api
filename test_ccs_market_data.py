@@ -7,6 +7,8 @@ import openpyxl
 
 from ccs_market_data import (
     CCS_CAVEATS,
+    attach_ccs_public_market_benchmark_if_available,
+    build_public_market_benchmark,
     get_sa3_ccs_metric,
     parse_ccs_workbook,
     rank_sa3_by_children_0_5_per_cbdc_service,
@@ -17,7 +19,9 @@ FORBIDDEN_PHRASES = [
     "demand per centre",
     "proof of demand",
     "proof of occupancy",
-    "unmet demand",
+    "actual demand",
+    "true demand",
+    "definitive unmet demand",
 ]
 
 
@@ -155,6 +159,72 @@ class CcsMarketDataTests(unittest.TestCase):
         self.assertGreaterEqual(len(ranked), 2)
         self.assertEqual(ranked[0]["sa3_name"], "Synthetic Growth")
         self.assertGreater(ranked[0]["children_0_5_per_cbdc_service"], ranked[1]["children_0_5_per_cbdc_service"])
+
+    def test_public_market_benchmark_requires_parsed_ccs_and_target_sa3(self):
+        self.assertIsNone(build_public_market_benchmark(None, target_sa3_code="21104"))
+        parsed = self.parse_synthetic()
+        self.assertIsNone(build_public_market_benchmark(parsed))
+        self.assertIsNone(build_public_market_benchmark(parsed, target_sa3_code="00000"))
+
+    def test_public_market_benchmark_builds_from_matching_sa3_code(self):
+        parsed = self.parse_synthetic()
+        benchmark = build_public_market_benchmark(parsed, target_sa3_code="21104")
+        self.assertIsNotNone(benchmark)
+        assert benchmark is not None
+        self.assertEqual(benchmark["source"], "Department of Education CCS quarterly data")
+        self.assertEqual(benchmark["source_quality"], "authoritative_public_aggregate")
+        self.assertEqual(benchmark["as_of_quarter"], "Dec 2025")
+        self.assertEqual(benchmark["sa3_code"], "21104")
+        self.assertEqual(benchmark["sa3_name"], "Whitehorse - East")
+        self.assertEqual(benchmark["state"], "VIC")
+        self.assertEqual(benchmark["children_0_5_using_care"], 2320)
+        self.assertEqual(benchmark["children_6_plus_using_care"], 1390)
+        self.assertEqual(benchmark["total_children_using_care"], 3710)
+        self.assertEqual(benchmark["families_using_care"], 2840)
+        self.assertEqual(benchmark["all_approved_services"], 38)
+        self.assertEqual(benchmark["cbdc_services"], 28)
+        self.assertAlmostEqual(benchmark["children_0_5_per_cbdc_service"], 82.86, places=2)
+        self.assertAlmostEqual(benchmark["total_children_per_all_service"], 97.63, places=2)
+        self.assertAlmostEqual(benchmark["cbdc_density_per_1000_children_0_5"], 12.07, places=2)
+        self.assertAlmostEqual(benchmark["cbdc_mean_fee_per_hour"], 14.52, places=2)
+        self.assertAlmostEqual(benchmark["cbdc_fee_growth_yoy_pct"], 4.69, places=2)
+        self.assertAlmostEqual(benchmark["cbdc_services_above_cap_pct"], 46.4, places=1)
+        self.assertIn("public aggregate market evidence", " ".join(benchmark["caveats"]))
+        self.assertIn("target_occupancy", benchmark["not_underwriting_use"])
+        self.assertIn("licensed_place_capacity", benchmark["not_underwriting_use"])
+
+    def test_public_market_benchmark_builds_from_matching_sa3_name(self):
+        parsed = self.parse_synthetic()
+        benchmark = build_public_market_benchmark(parsed, target_sa3_name="whitehorse - east")
+        self.assertIsNotNone(benchmark)
+        assert benchmark is not None
+        self.assertEqual(benchmark["sa3_code"], "21104")
+        self.assertAlmostEqual(benchmark["children_0_5_per_cbdc_service"], 82.86, places=2)
+
+    def test_attach_ccs_public_market_benchmark_is_noop_until_matched(self):
+        parsed = self.parse_synthetic()
+        audit = {"warnings": ["existing warning"]}
+        self.assertEqual(attach_ccs_public_market_benchmark_if_available(audit, None, target_sa3_code="21104"), audit)
+        self.assertEqual(attach_ccs_public_market_benchmark_if_available(audit, parsed), audit)
+        self.assertEqual(attach_ccs_public_market_benchmark_if_available(audit, parsed, target_sa3_code="00000"), audit)
+
+    def test_attach_ccs_public_market_benchmark_adds_only_benchmark(self):
+        parsed = self.parse_synthetic()
+        audit = {"warnings": ["existing warning"]}
+        attached = attach_ccs_public_market_benchmark_if_available(audit, parsed, target_sa3_code="21104")
+        self.assertEqual(attached["warnings"], ["existing warning"])
+        self.assertIn("public_market_benchmark", attached)
+        self.assertNotIn("local_demand_supply", attached)
+        self.assertNotIn("public_market_benchmark", audit)
+
+    def test_public_market_benchmark_avoids_forbidden_phrases(self):
+        parsed = self.parse_synthetic()
+        benchmark = build_public_market_benchmark(parsed, target_sa3_code="21104")
+        assert benchmark is not None
+        text = " ".join(str(value).lower() for value in benchmark.values() if not isinstance(value, list))
+        text += " " + " ".join(str(item).lower() for key in ("caveats", "underwriting_use") for item in benchmark[key])
+        for phrase in FORBIDDEN_PHRASES:
+            self.assertNotIn(phrase, text)
 
     def test_missing_required_tabs_hard_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,6 @@
 import os, json, re, base64, tempfile, shutil, copy, uuid, mimetypes, logging, csv, subprocess
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, List
 from fastapi import FastAPI, Query
@@ -14,6 +15,7 @@ import zipfile
 import docx as python_docx   # python-docx
 import xlrd                   # legacy .xls support
 from demand_service import compute_demand, market_position_score, build_market_audit, POSTCODE_AREA_KM2
+from ccs_market_data import attach_ccs_public_market_benchmark_if_available, parse_ccs_workbook
 from geospatial_competitors import get_nearby_competitors, material_supply_difference
 from pipeline_supply import build_pipeline_supply
 from run_diff import build_run_diff
@@ -50,6 +52,54 @@ HIGH_VALUE_PAGE_KEYWORDS = (
 
 VISION_PROVIDER = "anthropic"
 VISION_AUTH_INVALID_RE = re.compile(r"401|invalid x-api-key|authentication_error|unauthorized", re.I)
+
+
+def extract_target_sa3_from_extracted(extracted: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return explicit SA3 fields only; this does not infer SA3 from postcode/address."""
+    if not isinstance(extracted, dict):
+        return None, None
+    sa3_code = None
+    sa3_name = None
+    for section_name in ("centre", "location", "market", "demographics"):
+        section = extracted.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        if sa3_code is None and section.get("sa3_code") is not None:
+            sa3_code = str(section.get("sa3_code")).strip() or None
+        if sa3_name is None and section.get("sa3_name") is not None:
+            sa3_name = str(section.get("sa3_name")).strip() or None
+        if sa3_code and sa3_name:
+            break
+    return sa3_code, sa3_name
+
+
+@lru_cache(maxsize=1)
+def load_ccs_public_market_benchmark_from_env() -> dict[str, Any] | None:
+    workbook_path = os.environ.get("ACQUIRA_CCS_WORKBOOK_PATH")
+    quarter = os.environ.get("ACQUIRA_CCS_QUARTER")
+    source_url = os.environ.get("ACQUIRA_CCS_SOURCE_URL")
+    if not workbook_path or not quarter:
+        return None
+    try:
+        return parse_ccs_workbook(workbook_path, quarter, source_url=source_url)
+    except Exception as exc:
+        logger.warning("ccs_public_market_benchmark.load_failed path=%s error=%s", workbook_path, exc)
+        return None
+
+
+def attach_ccs_public_market_benchmark_from_env(extracted: dict[str, Any], market_audit: dict[str, Any]) -> dict[str, Any]:
+    parsed_ccs = load_ccs_public_market_benchmark_from_env()
+    if not parsed_ccs:
+        return market_audit
+    target_sa3_code, target_sa3_name = extract_target_sa3_from_extracted(extracted)
+    if not target_sa3_code and not target_sa3_name:
+        return market_audit
+    return attach_ccs_public_market_benchmark_if_available(
+        market_audit,
+        parsed_ccs,
+        target_sa3_code=target_sa3_code,
+        target_sa3_name=target_sa3_name,
+    )
 
 def classify_vision_provider_error(error: Exception | str) -> str:
     message = str(error)
@@ -2662,6 +2712,7 @@ async def pipeline(req: PipelineRequest):
                         vendor_kids_0_4=_vendor_kids,
                         competitor_supply=_competitor_supply,
                     )
+                    _market_audit = attach_ccs_public_market_benchmark_from_env(extracted, _market_audit)
                     extracted["_demand_context"] = _demand_ctx
                     extracted["_market_context"] = _market_ctx
                     extracted["_market_audit"] = _market_audit
@@ -2670,18 +2721,18 @@ async def pipeline(req: PipelineRequest):
                 else:
                     extracted["_demand_context"] = None
                     extracted["_market_context"] = None
-                    extracted["_market_audit"] = {
+                    extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(extracted, {
                         "warnings": ["Market audit unavailable because postcode was not extracted."],
-                    }
+                    })
                     extracted["_pipeline_projects"] = _pipeline_projects
                     extracted["_pipeline_audit"] = _pipeline_audit
             except Exception as _de:
                 print(f"[demand_service] error (non-fatal): {_de}")
                 extracted["_demand_context"] = None
                 extracted["_market_context"] = None
-                extracted["_market_audit"] = {
+                extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(extracted, {
                     "warnings": [f"Market audit unavailable because demand model failed: {_de}"],
-                }
+                })
                 try:
                     _pipeline_supply = build_pipeline_supply(req.pipelineProjects, req.pipelineIntel)
                     extracted["_pipeline_projects"] = _pipeline_supply["pipeline_projects"]

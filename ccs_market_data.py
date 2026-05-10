@@ -265,6 +265,63 @@ def get_sa3_ccs_metric(parsed: dict[str, Any], sa3_name: str | None = None, sa3_
     return None
 
 
+def build_public_market_benchmark(
+    parsed_ccs: dict[str, Any] | None,
+    target_sa3_code: str | None = None,
+    target_sa3_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Format a matched SA3 CCS row for workflow.market_audit attachment."""
+    if not isinstance(parsed_ccs, dict):
+        return None
+    if not target_sa3_code and not target_sa3_name:
+        return None
+    metric = get_sa3_ccs_metric(parsed_ccs, sa3_name=target_sa3_name, sa3_code=target_sa3_code)
+    if not metric:
+        return None
+    version = parsed_ccs.get("version") if isinstance(parsed_ccs.get("version"), dict) else {}
+    return {
+        "source": version.get("source") or SOURCE_NAME,
+        "source_quality": version.get("source_quality") or SOURCE_QUALITY,
+        "as_of_quarter": version.get("quarter") or metric.get("quarter"),
+        "sa3_code": metric.get("sa3_code"),
+        "sa3_name": metric.get("sa3_name"),
+        "state": metric.get("state"),
+        "children_0_5_using_care": metric.get("children_0_5_using_care"),
+        "children_6_plus_using_care": metric.get("children_6_plus_using_care"),
+        "total_children_using_care": metric.get("total_children_using_care"),
+        "families_using_care": metric.get("families_using_care"),
+        "all_approved_services": metric.get("all_approved_services"),
+        "cbdc_services": metric.get("cbdc_services"),
+        "children_0_5_per_cbdc_service": metric.get("children_0_5_per_cbdc_service"),
+        "total_children_per_all_service": metric.get("total_children_per_all_service"),
+        "cbdc_density_per_1000_children_0_5": metric.get("cbdc_density_per_1000_children_0_5"),
+        "cbdc_mean_fee_per_hour": metric.get("cbdc_mean_fee_per_hour"),
+        "cbdc_fee_growth_yoy_pct": metric.get("cbdc_fee_growth_yoy_pct"),
+        "cbdc_services_above_cap_pct": metric.get("cbdc_services_above_cap_pct"),
+        "caveats": list(metric.get("caveats") or CCS_CAVEATS),
+        "underwriting_use": list(metric.get("underwriting_use") or UNDERWRITING_USE),
+        "not_underwriting_use": list(metric.get("not_underwriting_use") or NOT_UNDERWRITING_USE),
+    }
+
+
+def attach_ccs_public_market_benchmark_if_available(
+    market_audit: dict[str, Any],
+    parsed_ccs: dict[str, Any] | None,
+    target_sa3_code: str | None = None,
+    target_sa3_name: str | None = None,
+) -> dict[str, Any]:
+    """Attach a CCS public aggregate benchmark when an explicit target SA3 is supplied."""
+    result = dict(market_audit or {})
+    benchmark = build_public_market_benchmark(
+        parsed_ccs,
+        target_sa3_code=target_sa3_code,
+        target_sa3_name=target_sa3_name,
+    )
+    if benchmark:
+        result["public_market_benchmark"] = benchmark
+    return result
+
+
 def rank_sa3_by_children_0_5_per_cbdc_service(parsed: dict[str, Any], state: str | None = None) -> list[dict[str, Any]]:
     state_filter = state.strip().lower() if state else None
     metrics = []
