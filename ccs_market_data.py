@@ -269,6 +269,7 @@ def build_public_market_benchmark(
     parsed_ccs: dict[str, Any] | None,
     target_sa3_code: str | None = None,
     target_sa3_name: str | None = None,
+    sa3_selection_source: str | None = None,
 ) -> dict[str, Any] | None:
     """Format a matched SA3 CCS row for workflow.market_audit attachment."""
     if not isinstance(parsed_ccs, dict):
@@ -279,7 +280,10 @@ def build_public_market_benchmark(
     if not metric:
         return None
     version = parsed_ccs.get("version") if isinstance(parsed_ccs.get("version"), dict) else {}
-    return {
+    caveats = list(metric.get("caveats") or CCS_CAVEATS)
+    if sa3_selection_source == "manual_context":
+        caveats.append("SA3 selection came from manual/admin context, not source-document extraction.")
+    benchmark = {
         "source": version.get("source") or SOURCE_NAME,
         "source_quality": version.get("source_quality") or SOURCE_QUALITY,
         "as_of_quarter": version.get("quarter") or metric.get("quarter"),
@@ -298,10 +302,18 @@ def build_public_market_benchmark(
         "cbdc_mean_fee_per_hour": metric.get("cbdc_mean_fee_per_hour"),
         "cbdc_fee_growth_yoy_pct": metric.get("cbdc_fee_growth_yoy_pct"),
         "cbdc_services_above_cap_pct": metric.get("cbdc_services_above_cap_pct"),
-        "caveats": list(metric.get("caveats") or CCS_CAVEATS),
+        "caveats": caveats,
         "underwriting_use": list(metric.get("underwriting_use") or UNDERWRITING_USE),
         "not_underwriting_use": list(metric.get("not_underwriting_use") or NOT_UNDERWRITING_USE),
     }
+    if sa3_selection_source:
+        benchmark["sa3_selection_source"] = sa3_selection_source
+        benchmark["sa3_selection_note"] = (
+            "SA3 was supplied through manual/admin context."
+            if sa3_selection_source == "manual_context"
+            else "SA3 was explicitly extracted from source documents."
+        )
+    return benchmark
 
 
 def attach_ccs_public_market_benchmark_if_available(
@@ -309,6 +321,7 @@ def attach_ccs_public_market_benchmark_if_available(
     parsed_ccs: dict[str, Any] | None,
     target_sa3_code: str | None = None,
     target_sa3_name: str | None = None,
+    sa3_selection_source: str | None = None,
 ) -> dict[str, Any]:
     """Attach a CCS public aggregate benchmark when an explicit target SA3 is supplied."""
     result = dict(market_audit or {})
@@ -316,6 +329,7 @@ def attach_ccs_public_market_benchmark_if_available(
         parsed_ccs,
         target_sa3_code=target_sa3_code,
         target_sa3_name=target_sa3_name,
+        sa3_selection_source=sa3_selection_source,
     )
     if benchmark:
         result["public_market_benchmark"] = benchmark

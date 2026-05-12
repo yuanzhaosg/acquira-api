@@ -66,9 +66,13 @@ if importlib.util.find_spec("xlrd") is None:
     sys.modules["xlrd"] = xlrd
 
 from main import (
+    ManualContext,
+    ManualEvidenceNote,
     attach_ccs_public_market_benchmark_from_env,
+    extract_manual_sa3_override,
     extract_target_sa3_from_extracted,
     load_ccs_public_market_benchmark_from_env,
+    resolve_target_sa3_for_public_market,
 )
 from structured_deal import build_structured_deal_intelligence
 from test_ccs_market_data import make_synthetic_workbook
@@ -91,6 +95,35 @@ class CcsPublicMarketAttachmentTests(unittest.TestCase):
         self.assertEqual(
             extract_target_sa3_from_extracted({"demographics": {"sa3_name": "Whitehorse - East"}}),
             (None, "Whitehorse - East"),
+        )
+
+    def test_manual_sa3_override_can_use_context_or_notes(self):
+        self.assertEqual(
+            extract_manual_sa3_override(ManualContext(sa3Code="21104", sa3Name="Whitehorse - East")),
+            ("21104", "Whitehorse - East"),
+        )
+        self.assertEqual(
+            extract_manual_sa3_override({"sa3_code": "21104"}),
+            ("21104", None),
+        )
+        self.assertEqual(
+            extract_manual_sa3_override(
+                manual_notes=[ManualEvidenceNote(notes="SA3 code: 21104\nSA3 name: Whitehorse - East")]
+            ),
+            ("21104", "Whitehorse - East"),
+        )
+
+    def test_manual_sa3_takes_priority_over_extracted_sa3(self):
+        self.assertEqual(
+            resolve_target_sa3_for_public_market(
+                {"centre": {"sa3_code": "99999", "sa3_name": "Wrong SA3"}},
+                manual_context=ManualContext(sa3Code="21104", sa3Name="Whitehorse - East"),
+            ),
+            ("21104", "Whitehorse - East", "manual_context"),
+        )
+        self.assertEqual(
+            resolve_target_sa3_for_public_market({"centre": {"sa3_code": "21104"}}),
+            ("21104", None, "source_document_explicit"),
         )
 
     def test_env_missing_path_is_noop(self):
@@ -133,6 +166,69 @@ class CcsPublicMarketAttachmentTests(unittest.TestCase):
         self.assertAlmostEqual(attached["public_market_benchmark"]["children_0_5_per_cbdc_service"], 82.86, places=2)
         self.assertNotIn("local_demand_supply", attached)
         self.assertNotIn("public_market_benchmark", audit)
+
+    def test_env_workbook_and_manual_sa3_code_attach_public_benchmark_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workbook_path = Path(tmp) / "ccs.xlsx"
+            make_synthetic_workbook(workbook_path)
+            load_ccs_public_market_benchmark_from_env.cache_clear()
+            with patch.dict(os.environ, {
+                "ACQUIRA_CCS_WORKBOOK_PATH": str(workbook_path),
+                "ACQUIRA_CCS_QUARTER": "Dec 2025",
+            }, clear=True):
+                audit = {"warnings": []}
+                attached = attach_ccs_public_market_benchmark_from_env(
+                    {"centre": {"postcode": "3131", "sa3_code": "99999"}},
+                    audit,
+                    manual_context=ManualContext(sa3Code="21104"),
+                )
+
+        benchmark = attached["public_market_benchmark"]
+        self.assertEqual(benchmark["sa3_code"], "21104")
+        self.assertEqual(benchmark["sa3_selection_source"], "manual_context")
+        self.assertIn("manual/admin context", " ".join(benchmark["caveats"]))
+        self.assertNotIn("local_demand_supply", attached)
+        self.assertNotIn("public_market_benchmark", audit)
+
+    def test_env_workbook_and_manual_sa3_name_attach_public_benchmark_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workbook_path = Path(tmp) / "ccs.xlsx"
+            make_synthetic_workbook(workbook_path)
+            load_ccs_public_market_benchmark_from_env.cache_clear()
+            with patch.dict(os.environ, {
+                "ACQUIRA_CCS_WORKBOOK_PATH": str(workbook_path),
+                "ACQUIRA_CCS_QUARTER": "Dec 2025",
+            }, clear=True):
+                attached = attach_ccs_public_market_benchmark_from_env(
+                    {"centre": {"postcode": "3131"}},
+                    {"warnings": []},
+                    manual_context=ManualContext(sa3Name="whitehorse - east"),
+                )
+
+        self.assertEqual(attached["public_market_benchmark"]["sa3_code"], "21104")
+        self.assertEqual(attached["public_market_benchmark"]["sa3_selection_source"], "manual_context")
+        self.assertNotIn("local_demand_supply", attached)
+
+    def test_manual_sa3_does_not_become_source_document_fact(self):
+        workflow = build_structured_deal_intelligence(
+            extracted={
+                "centre": {
+                    "name": "Manual SA3 Fixture",
+                    "postcode": "3131",
+                    "licensed_places": 55,
+                },
+                "meta": {"missing_fields": []},
+            },
+            scored={"centre_name": "Manual SA3 Fixture", "total_score": 50, "deal_breaker_flags": {"flags": []}},
+            combined_text="Postcode: 3131",
+            source_files=["qa.txt"],
+            file_classes={"qa.txt": "qa_fixture"},
+        )
+
+        fields = {fact["field"] for fact in workflow["facts"]}
+        self.assertNotIn("sa3_code", fields)
+        self.assertNotIn("sa3_name", fields)
+        self.assertFalse(any("sa3" in str(field).lower() for field in workflow["missing_fields"]))
 
     def test_structured_workflow_preserves_public_benchmark_under_market_audit(self):
         with tempfile.TemporaryDirectory() as tmp:

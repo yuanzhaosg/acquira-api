@@ -73,6 +73,73 @@ def extract_target_sa3_from_extracted(extracted: dict[str, Any]) -> tuple[str | 
     return sa3_code, sa3_name
 
 
+def _clean_sa3_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def extract_manual_sa3_override(
+    manual_context: Any = None,
+    manual_notes: list[Any] | None = None,
+) -> tuple[str | None, str | None]:
+    """Return explicit manual/admin SA3 only; this does not infer from postcode/address."""
+    if manual_context is not None:
+        if isinstance(manual_context, BaseModel):
+            context = manual_context.model_dump(by_alias=False)
+        elif isinstance(manual_context, dict):
+            context = manual_context
+        else:
+            context = {}
+        code = _clean_sa3_value(
+            context.get("sa3_code")
+            or context.get("sa3Code")
+            or context.get("target_sa3_code")
+            or context.get("targetSa3Code")
+        )
+        name = _clean_sa3_value(
+            context.get("sa3_name")
+            or context.get("sa3Name")
+            or context.get("target_sa3_name")
+            or context.get("targetSa3Name")
+        )
+        if code or name:
+            return code, name
+
+    for note in manual_notes or []:
+        code = _clean_sa3_value(getattr(note, "sa3_code", None) if not isinstance(note, dict) else note.get("sa3_code") or note.get("sa3Code"))
+        name = _clean_sa3_value(getattr(note, "sa3_name", None) if not isinstance(note, dict) else note.get("sa3_name") or note.get("sa3Name"))
+        if code or name:
+            return code, name
+        question = getattr(note, "question", None) if not isinstance(note, dict) else note.get("question")
+        notes = getattr(note, "notes", None) if not isinstance(note, dict) else note.get("notes")
+        status = getattr(note, "status", None) if not isinstance(note, dict) else note.get("status")
+        haystack = "\n".join(str(part) for part in (question, notes, status) if part)
+        code_match = re.search(r"\b(?:sa3|statistical\s+area\s+3)\s*(?:code)?\b\s*[:=\-]?\s*(\d{5})\b", haystack, re.IGNORECASE)
+        name_match = re.search(r"\b(?:sa3\s+(?:name|area)|statistical\s+area\s+3\s+(?:name|area)?)\b\s*[:=\-]?\s*([A-Za-z][A-Za-z0-9 &'().,\-/]{2,100})", haystack, re.IGNORECASE)
+        if code_match or name_match:
+            return (
+                code_match.group(1).strip() if code_match else None,
+                name_match.group(1).strip(" .,:;-") if name_match else None,
+            )
+    return None, None
+
+
+def resolve_target_sa3_for_public_market(
+    extracted: dict[str, Any],
+    manual_context: Any = None,
+    manual_notes: list[Any] | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    manual_code, manual_name = extract_manual_sa3_override(manual_context, manual_notes)
+    if manual_code or manual_name:
+        return manual_code, manual_name, "manual_context"
+    extracted_code, extracted_name = extract_target_sa3_from_extracted(extracted)
+    if extracted_code or extracted_name:
+        return extracted_code, extracted_name, "source_document_explicit"
+    return None, None, None
+
+
 @lru_cache(maxsize=1)
 def load_ccs_public_market_benchmark_from_env() -> dict[str, Any] | None:
     workbook_path = os.environ.get("ACQUIRA_CCS_WORKBOOK_PATH")
@@ -87,11 +154,20 @@ def load_ccs_public_market_benchmark_from_env() -> dict[str, Any] | None:
         return None
 
 
-def attach_ccs_public_market_benchmark_from_env(extracted: dict[str, Any], market_audit: dict[str, Any]) -> dict[str, Any]:
+def attach_ccs_public_market_benchmark_from_env(
+    extracted: dict[str, Any],
+    market_audit: dict[str, Any],
+    manual_context: Any = None,
+    manual_notes: list[Any] | None = None,
+) -> dict[str, Any]:
     parsed_ccs = load_ccs_public_market_benchmark_from_env()
     if not parsed_ccs:
         return market_audit
-    target_sa3_code, target_sa3_name = extract_target_sa3_from_extracted(extracted)
+    target_sa3_code, target_sa3_name, sa3_selection_source = resolve_target_sa3_for_public_market(
+        extracted,
+        manual_context=manual_context,
+        manual_notes=manual_notes,
+    )
     if not target_sa3_code and not target_sa3_name:
         return market_audit
     return attach_ccs_public_market_benchmark_if_available(
@@ -99,6 +175,7 @@ def attach_ccs_public_market_benchmark_from_env(extracted: dict[str, Any], marke
         parsed_ccs,
         target_sa3_code=target_sa3_code,
         target_sa3_name=target_sa3_name,
+        sa3_selection_source=sa3_selection_source,
     )
 
 def classify_vision_provider_error(error: Exception | str) -> str:
@@ -997,6 +1074,12 @@ class PipelineProject(BaseModel):
     confidence: Optional[str] = None
     notes: Optional[str] = None
 
+class ManualContext(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    sa3_code: Optional[str] = Field(default=None, alias="sa3Code")
+    sa3_name: Optional[str] = Field(default=None, alias="sa3Name")
+
 class PipelineRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -1009,6 +1092,7 @@ class PipelineRequest(BaseModel):
     # Pipeline intelligence (optional)
     pipelineIntel: Optional[PipelineIntel] = None
     pipelineProjects: Optional[list[PipelineProject]] = None
+    manual_context: Optional[ManualContext] = Field(default=None, alias="manualContext")
 
     def resolved_paths(self) -> list[str]:
         if self.storagePaths:
@@ -1047,6 +1131,8 @@ class SelectedSourceDocument(BaseModel):
     file_size: Optional[int] = None
 
 class ManualEvidenceNote(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     source_type: str = "manual_user_note"
     source_label: Optional[str] = None
     diligence_item_id: Optional[str] = None
@@ -1055,8 +1141,12 @@ class ManualEvidenceNote(BaseModel):
     question: Optional[str] = None
     notes: Optional[str] = None
     confidence: str = "low"
+    sa3_code: Optional[str] = Field(default=None, alias="sa3Code")
+    sa3_name: Optional[str] = Field(default=None, alias="sa3Name")
 
 class ReunderwriteRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     deal_id: str
     run_id: str
     base_run_id: str
@@ -1067,6 +1157,7 @@ class ReunderwriteRequest(BaseModel):
     input_document_count: Optional[int] = None
     input_total_bytes: Optional[int] = None
     pipeline_projects: Optional[list[PipelineProject]] = None
+    manual_context: Optional[ManualContext] = Field(default=None, alias="manualContext")
     mode: str = "reunderwrite"
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1627,6 +1718,7 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
         selected_diligence_documents = req.selected_diligence_documents or []
         selected_source_documents = req.selected_source_documents or []
         manual_notes = req.manual_evidence_notes or []
+        manual_context = req.manual_context
         manual_asking_price = asking_price_from_manual_notes(manual_notes)
         if not selected_diligence_documents and not selected_source_documents and not manual_notes:
             return reunderwrite_error("invalid_input", "At least one selected diligence document, source document, or manual evidence note is required", 400)
@@ -1752,6 +1844,12 @@ async def pipeline_reunderwrite(req: ReunderwriteRequest):
         for key in ("_demand_context", "_market_context", "_market_audit"):
             if not merged_extracted.get(key) and base_extracted.get(key):
                 merged_extracted[key] = copy.deepcopy(base_extracted[key])
+        merged_extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(
+            merged_extracted,
+            merged_extracted.get("_market_audit") or {"warnings": ["Market audit unavailable in base snapshot."]},
+            manual_context=manual_context,
+            manual_notes=manual_notes,
+        )
 
         centre_name = merged_extracted.get("centre", {}).get("name") or base_scored.get("centre_name") or "centre"
         demand_context = merged_extracted.get("_demand_context")
@@ -2713,7 +2811,11 @@ async def pipeline(req: PipelineRequest):
                         vendor_kids_0_4=_vendor_kids,
                         competitor_supply=_competitor_supply,
                     )
-                    _market_audit = attach_ccs_public_market_benchmark_from_env(extracted, _market_audit)
+                    _market_audit = attach_ccs_public_market_benchmark_from_env(
+                        extracted,
+                        _market_audit,
+                        manual_context=req.manual_context,
+                    )
                     extracted["_demand_context"] = _demand_ctx
                     extracted["_market_context"] = _market_ctx
                     extracted["_market_audit"] = _market_audit
@@ -2722,18 +2824,22 @@ async def pipeline(req: PipelineRequest):
                 else:
                     extracted["_demand_context"] = None
                     extracted["_market_context"] = None
-                    extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(extracted, {
-                        "warnings": ["Market audit unavailable because postcode was not extracted."],
-                    })
+                    extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(
+                        extracted,
+                        {"warnings": ["Market audit unavailable because postcode was not extracted."]},
+                        manual_context=req.manual_context,
+                    )
                     extracted["_pipeline_projects"] = _pipeline_projects
                     extracted["_pipeline_audit"] = _pipeline_audit
             except Exception as _de:
                 print(f"[demand_service] error (non-fatal): {_de}")
                 extracted["_demand_context"] = None
                 extracted["_market_context"] = None
-                extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(extracted, {
-                    "warnings": [f"Market audit unavailable because demand model failed: {_de}"],
-                })
+                extracted["_market_audit"] = attach_ccs_public_market_benchmark_from_env(
+                    extracted,
+                    {"warnings": [f"Market audit unavailable because demand model failed: {_de}"]},
+                    manual_context=req.manual_context,
+                )
                 try:
                     _pipeline_supply = build_pipeline_supply(req.pipelineProjects, req.pipelineIntel)
                     extracted["_pipeline_projects"] = _pipeline_supply["pipeline_projects"]
