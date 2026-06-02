@@ -866,6 +866,94 @@ def remove_fee_missing_markers(extracted: dict[str, Any], fee_facts: list[dict[s
     meta["missing_fields_count"] = len(meta["missing_fields"])
 
 
+def _infer_deal_type(extracted: dict[str, Any], combined_text: str | None) -> str:
+    """Leasehold vs freehold. Default leasehold (business-sale going concern)
+    when a lease is present and no freehold signal is found."""
+    lease = extracted.get("lease") or {}
+    dt = (extracted.get("deal_type") or _get(extracted, "centre", "deal_type") or "").strip().lower()
+    if "freehold" in dt:
+        return "freehold"
+    if "leasehold" in dt or "going concern" in dt:
+        return "leasehold"
+    text = (combined_text or "").lower()
+    if "freehold" in text and "going concern" in text and "leasehold" not in text:
+        return "freehold"
+    # A lease summary / rent / expiry present → leasehold business sale.
+    if lease.get("expiry_date") or lease.get("term_years") or lease.get("base_rent_pa_fy25"):
+        return "leasehold"
+    return "leasehold"
+
+
+def build_valuation_multiple(
+    extracted: dict[str, Any],
+    scored: dict[str, Any],
+    combined_text: str | None = None,
+) -> dict[str, Any]:
+    """Deterministic business-sale multiple + factor trail (single source of
+    truth; the frontend should consume this rather than recomputing)."""
+    from valuation_multiple import compute_multiple, apply_multiple
+
+    centre = extracted.get("centre") or {}
+    fy25 = _get(extracted, "financials", "fy25") or {}
+    ratios = extracted.get("key_ratios") or {}
+    occupancy = extracted.get("occupancy") or {}
+    lease = extracted.get("lease") or {}
+    dims = scored.get("dimensions") or {}
+    demand = scored.get("demand_context") or {}
+
+    places = centre.get("licensed_places") or ratios.get("licensed_places")
+    occ = (occupancy.get("current_month_pct") or occupancy.get("latest_week_pct")
+           or occupancy.get("avg_4wk_pct"))
+    occ_declining = str(occupancy.get("trend") or "").lower() == "declining" or bool(
+        fy25.get("revenue_trend") and "declin" in str(fy25.get("revenue_trend")).lower()
+    )
+    nqs = centre.get("nqs_rating")
+    years_remaining = lease.get("remaining_term_years")
+    if years_remaining is None and lease.get("days_remaining") is not None:
+        years_remaining = round(lease["days_remaining"] / 365, 1)
+    lease_tail = (dims.get("lease_tail") or {}).get("detail") or {}
+    options_years = None
+    if lease_tail.get("total_potential_tenure") is not None and years_remaining is not None:
+        options_years = max(0, lease_tail["total_potential_tenure"] - years_remaining)
+    rent_ratio = fy25.get("rent_ratio_pct") or ratios.get("rent_ratio_fy25_pct")
+    owner_operated = (
+        (extracted.get("staffing") or {}).get("owner_operated")
+        if (extracted.get("staffing") or {}).get("owner_operated") is not None
+        else ((dims.get("operator_quality") or {}).get("detail") or {}).get("owner_operated")
+    )
+    growth_factor = demand.get("growth_factor")
+    growth_corridor = bool(growth_factor and growth_factor >= 1.08)
+
+    deal_type = _infer_deal_type(extracted, combined_text)
+    result = compute_multiple(
+        deal_type=deal_type,
+        licensed_places=places,
+        occupancy_pct=occ,
+        occupancy_declining=occ_declining,
+        nqs_rating=nqs,
+        lease_years_remaining=years_remaining,
+        lease_options_years=options_years,
+        owner_operated=owner_operated,
+        rent_to_revenue_pct=rent_ratio,
+        growth_corridor=growth_corridor,
+    )
+
+    ebitda = fy25.get("ebitda") or ratios.get("ebitda_fy25")
+    if result.get("applicable") and ebitda:
+        result["valuation"] = apply_multiple(
+            result, normalised_ebitda=ebitda, licensed_places=places,
+        )
+    result["deal_type"] = deal_type
+    result["inputs_used"] = {
+        "licensed_places": places, "occupancy_pct": occ, "occupancy_declining": occ_declining,
+        "nqs_rating": nqs, "lease_years_remaining": years_remaining,
+        "lease_options_years": options_years, "rent_to_revenue_pct": rent_ratio,
+        "owner_operated": owner_operated, "growth_corridor": growth_corridor,
+        "ebitda": ebitda,
+    }
+    return result
+
+
 def build_structured_deal_intelligence(
     extracted: dict[str, Any],
     scored: dict[str, Any],
@@ -920,6 +1008,7 @@ def build_structured_deal_intelligence(
         })
 
     deal_summary = build_deal_summary(extracted, scored)
+    valuation_multiple = build_valuation_multiple(extracted, scored, combined_text)
     market_audit = scored.get("market_audit") or extracted.get("_market_audit")
     pipeline_audit = scored.get("pipeline_audit") or extracted.get("_pipeline_audit")
     narrative_guard = build_narrative_guard(
@@ -934,6 +1023,7 @@ def build_structured_deal_intelligence(
 
     return {
         "deal_summary": deal_summary,
+        "valuation_multiple": valuation_multiple,
         "facts": extracted_facts,
         "extracted_facts": extracted_facts,
         "missing_fields": missing_fields,
