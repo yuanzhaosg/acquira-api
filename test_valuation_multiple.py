@@ -138,3 +138,55 @@ class TestStrongMetroContrast(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestApiWiring(unittest.TestCase):
+    """build_valuation_multiple reads the structured-deal shape and attaches output."""
+
+    def _crown_kiddo(self):
+        extracted = {
+            "centre": {"name": "Crown Kiddo", "licensed_places": 55,
+                       "nqs_rating": "Working Towards NQS"},
+            "financials": {"fy25": {"ebitda": 233403, "revenue": 1576862,
+                                    "rent_ratio_pct": 7.0}},
+            "key_ratios": {},
+            "occupancy": {"current_month_pct": 71, "trend": "declining"},
+            "lease": {"remaining_term_years": 1, "expiry_date": "2027-08-01"},
+            "deal_type": "business sale - going concern (leasehold)",
+            "staffing": {"owner_operated": True},
+        }
+        scored = {"dimensions": {"lease_tail": {"detail": {"total_potential_tenure": 21}}},
+                  "demand_context": {"growth_factor": 1.10}}
+        return extracted, scored
+
+    def test_leasehold_wiring_reads_fields(self):
+        from structured_deal import build_valuation_multiple
+        extracted, scored = self._crown_kiddo()
+        r = build_valuation_multiple(extracted, scored, "leasehold going concern")
+        self.assertEqual(r["deal_type"], "leasehold")
+        self.assertTrue(r["applicable"])
+        self.assertLess(r["recommended_multiple"]["mid"], 4.0)
+        # The two previously-guessed inputs now flow from extraction:
+        self.assertEqual(r["inputs_used"]["owner_operated"], True)
+        self.assertEqual(r["inputs_used"]["lease_options_years"], 20)
+        self.assertTrue(r["inputs_used"]["occupancy_declining"])
+        self.assertIn("valuation", r)
+
+    def test_freehold_hits_guard_via_wiring(self):
+        from structured_deal import build_valuation_multiple
+        extracted, scored = self._crown_kiddo()
+        extracted["deal_type"] = "freehold going concern"
+        r = build_valuation_multiple(extracted, scored, "freehold")
+        self.assertFalse(r["applicable"])
+        self.assertIn("guard", r)
+
+    def test_attached_to_structured_deal_output(self):
+        from structured_deal import build_structured_deal_intelligence
+        extracted, scored = self._crown_kiddo()
+        scored.update({"centre_name": "Crown Kiddo", "total_score": 60, "dimensions": {
+            **scored["dimensions"]}})
+        out = build_structured_deal_intelligence(
+            extracted, scored, combined_text="leasehold going concern",
+            source_files=[], file_classes={})
+        self.assertIn("valuation_multiple", out)
+        self.assertEqual(out["valuation_multiple"]["deal_type"], "leasehold")
